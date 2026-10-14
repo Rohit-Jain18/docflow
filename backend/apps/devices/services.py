@@ -682,12 +682,17 @@ def revoke_device(
     request_id: str = "",
     ip_address: Optional[str] = None,
     reason: str = "Device self-revoked",
-) -> None:
+    actor_user=None,
+    reason_code: Optional[str] = None,
+) -> Device:
     """
     Atomically revoke a device and all its outstanding refresh credentials.
 
     Enforces:
       - Single transaction.atomic() with row lock on the device.
+      - Idempotent: repeated calls for an already-revoked device return a safe result
+        without repeatedly mutating revocation timestamps or duplicating audit events.
+      - Attributes revocation to actor_user (dashboard admin) or actor_device (agent self-revocation).
       - Transitions device status to REVOKED and sets revoked_at timestamp.
       - Revokes all outstanding refresh credentials for the device.
       - Emits AuditAction.DEVICE_REVOKED audit event with safe metadata.
@@ -696,6 +701,14 @@ def revoke_device(
 
     with transaction.atomic():
         dev = Device.objects.select_for_update().get(id=device.id)
+
+        # Idempotency check: if already revoked, return without re-mutating timestamps or duplicate audit
+        if dev.status == DeviceStatus.REVOKED:
+            DeviceRefreshCredential.objects.filter(
+                device=dev,
+                revoked_at__isnull=True,
+            ).update(revoked_at=now)
+            return dev
 
         # 1. Revoke all active refresh credentials for this device
         DeviceRefreshCredential.objects.filter(
@@ -716,19 +729,35 @@ def revoke_device(
             "device_name": dev.name,
             "device_id": str(dev.id),
             "branch_id": str(dev.branch_id),
-            "reason": reason,
             "status": DeviceStatus.REVOKED,
         }
+        if reason_code:
+            revoke_meta["reason_code"] = reason_code
+        else:
+            revoke_meta["reason"] = reason
         if ip_address:
             revoke_meta["ip_address"] = ip_address
 
-        AuditEvent.objects.create(
-            organization=dev.organization,
-            actor_device=dev,
-            action=AuditAction.DEVICE_REVOKED,
-            target_type="device",
-            target_id=str(dev.id),
-            request_id=request_id,
-            safe_metadata=revoke_meta,
-        )
+        if actor_user:
+            AuditEvent.objects.create(
+                organization=dev.organization,
+                actor_user=actor_user,
+                action=AuditAction.DEVICE_REVOKED,
+                target_type="device",
+                target_id=str(dev.id),
+                request_id=request_id,
+                safe_metadata=revoke_meta,
+            )
+        else:
+            AuditEvent.objects.create(
+                organization=dev.organization,
+                actor_device=dev,
+                action=AuditAction.DEVICE_REVOKED,
+                target_type="device",
+                target_id=str(dev.id),
+                request_id=request_id,
+                safe_metadata=revoke_meta,
+            )
+
+        return dev
 
