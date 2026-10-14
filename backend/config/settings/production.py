@@ -136,3 +136,19 @@ TEMP_UPLOAD_FICTIONAL_DATA_ONLY = False
 # Static files
 # ---------------------------------------------------------------------------
 STATIC_ROOT = BASE_DIR / "staticfiles"  # noqa: F405
+
+# ---------------------------------------------------------------------------
+# Reverse Proxy Trust Configuration
+# ---------------------------------------------------------------------------
+_trusted_proxies_raw = os.environ.get("DOCFLOW_TRUSTED_PROXIES", "")
+if _trusted_proxies_raw:
+    DOCFLOW_TRUSTED_PROXIES = tuple(
+        p.strip() for p in _trusted_proxies_raw.split(",") if p.strip()
+    )
+
+_num_proxies_raw = os.environ.get("DOCFLOW_NUM_PROXIES", "")
+if _num_proxies_raw.isdigit():
+    DOCFLOW_NUM_PROXIES = int(_num_proxies_raw)
+    NUM_PROXIES = DOCFLOW_NUM_PROXIES
+    REST_FRAMEWORK["NUM_PROXIES"] = DOCFLOW_NUM_PROXIES
+

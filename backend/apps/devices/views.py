@@ -26,18 +26,9 @@ from .serializers import (
     RefreshTokenSerializer,
     RevokeSelfSerializer,
 )
+from .ip_utils import get_client_ip
 from .services import exchange_activation_code, revoke_device, rotate_refresh_token
 from .throttling import ActivationRateThrottle, RefreshRateThrottle
-
-
-def get_client_ip(request) -> Optional[str]:
-    """Extract client IP address safely from request metadata."""
-    x_forwarded_for = request.META.get("HTTP_X_FORWARDED_FOR")
-    if x_forwarded_for:
-        ip = x_forwarded_for.split(",")[0].strip()
-        if ip:
-            return ip
-    return request.META.get("REMOTE_ADDR")
 
 
 class ActivationExchangeView(APIView):

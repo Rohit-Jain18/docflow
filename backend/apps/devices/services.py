@@ -489,6 +489,17 @@ def exchange_activation_code(
                 access_token, access_token_expires_at = generate_access_token(device)
 
                 # 6. Audit successful activation
+                activation_meta = {
+                    "device_name": device.name,
+                    "device_id": str(device.id),
+                    "branch_id": str(device.branch_id),
+                    "agent_version": device.agent_version or "unknown",
+                    "platform": device.platform,
+                    "status": "active",
+                }
+                if ip_address:
+                    activation_meta["ip_address"] = ip_address
+
                 AuditEvent.objects.create(
                     organization=device.organization,
                     actor_device=device,
@@ -496,14 +507,7 @@ def exchange_activation_code(
                     target_type="device",
                     target_id=str(device.id),
                     request_id=request_id,
-                    safe_metadata={
-                        "device_name": device.name,
-                        "device_id": str(device.id),
-                        "branch_id": str(device.branch_id),
-                        "agent_version": device.agent_version or "unknown",
-                        "platform": device.platform,
-                        "status": "active",
-                    },
+                    safe_metadata=activation_meta,
                 )
 
                 result = ActivationResult(
@@ -708,6 +712,16 @@ def revoke_device(
         dev.save(update_fields=["status", "revoked_at", "last_seen_at", "last_ip", "updated_at"])
 
         # 3. Emit safe audit event
+        revoke_meta = {
+            "device_name": dev.name,
+            "device_id": str(dev.id),
+            "branch_id": str(dev.branch_id),
+            "reason": reason,
+            "status": DeviceStatus.REVOKED,
+        }
+        if ip_address:
+            revoke_meta["ip_address"] = ip_address
+
         AuditEvent.objects.create(
             organization=dev.organization,
             actor_device=dev,
@@ -715,12 +729,6 @@ def revoke_device(
             target_type="device",
             target_id=str(dev.id),
             request_id=request_id,
-            safe_metadata={
-                "device_name": dev.name,
-                "device_id": str(dev.id),
-                "branch_id": str(dev.branch_id),
-                "reason": reason,
-                "status": DeviceStatus.REVOKED,
-            },
+            safe_metadata=revoke_meta,
         )
 

@@ -45,6 +45,8 @@ from apps.devices.services import (
     verify_access_token,
 )
 from apps.tenants.models import Branch, Lab, Organization
+from apps.devices.ip_utils import get_client_ip, is_valid_ip
+from apps.devices.throttling import ActivationRateThrottle, RefreshRateThrottle
 
 
 class DeviceAPIBaseTestCase(TestCase):
@@ -616,3 +618,237 @@ class DeviceAPISecurityAndContractTests(DeviceAPIBaseTestCase):
         # Ensure no audit event contains the raw secret
         events = AuditEvent.objects.filter(safe_metadata__icontains=super_secret_code)
         self.assertEqual(events.count(), 0)
+
+
+class ClientIPResolutionAndThrottlingSecurityTests(DeviceAPIBaseTestCase):
+    """
+    Security test suite verifying:
+      1. Default rejection of untrusted client-supplied X-Forwarded-For headers.
+      2. Strict fallback to REMOTE_ADDR when directly reachable.
+      3. Unified IP-resolution policy between DRF throttling and device telemetry/audit.
+      4. Inability of attackers to bypass rate limits by rotating X-Forwarded-For.
+      5. Correct right-to-left traversal when trusted proxies are explicitly configured.
+    """
+
+    def test_untrusted_x_forwarded_for_ignored_for_device_telemetry_and_audit(self):
+        issued = issue_activation_code(self.device, request_id="req-telemetry-sec")
+        payload = {
+            "activation_code": issued.raw_code,
+            "installation_id": "inst-sec-01",
+            "agent_version": "1.0.0",
+            "platform": "windows",
+        }
+
+        # Client attempts to spoof IP via X-Forwarded-For
+        response = self.client.post(
+            "/api/v1/agent/activation/exchange",
+            payload,
+            format="json",
+            REMOTE_ADDR="203.0.113.10",
+            HTTP_X_FORWARDED_FOR="198.51.100.99, 10.0.0.1",
+            HTTP_X_REQUEST_ID="req-telemetry-sec",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        # Device telemetry last_ip must be the actual REMOTE_ADDR, never the spoofed XFF
+        self.device.refresh_from_db()
+        self.assertEqual(self.device.last_ip, "203.0.113.10")
+
+        # Audit event metadata must record actual REMOTE_ADDR
+        audit_event = AuditEvent.objects.get(
+            action=AuditAction.DEVICE_ACTIVATED,
+            target_id=str(self.device.id),
+            request_id="req-telemetry-sec",
+        )
+        self.assertEqual(audit_event.safe_metadata.get("ip_address"), "203.0.113.10")
+
+    @override_settings(
+        REST_FRAMEWORK={
+            "DEFAULT_AUTHENTICATION_CLASSES": [],
+            "DEFAULT_PERMISSION_CLASSES": [],
+            "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
+            "DEFAULT_PARSER_CLASSES": ["rest_framework.parsers.JSONParser"],
+            "EXCEPTION_HANDLER": "apps.devices.exceptions.api_exception_handler",
+            "DEFAULT_THROTTLE_RATES": {"agent_activation": "2/minute", "agent_refresh": "30/minute"},
+            "NUM_PROXIES": 0,
+        },
+        DOCFLOW_TRUSTED_PROXIES=(),
+        DOCFLOW_NUM_PROXIES=0,
+    )
+    def test_untrusted_x_forwarded_for_cannot_bypass_activation_throttling(self):
+        # Request 1 from 203.0.113.50 with spoofed XFF
+        r1 = self.client.post(
+            "/api/v1/agent/activation/exchange",
+            {"activation_code": "code1", "installation_id": "inst1"},
+            format="json",
+            REMOTE_ADDR="203.0.113.50",
+            HTTP_X_FORWARDED_FOR="1.1.1.1",
+        )
+        self.assertEqual(r1.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Request 2 from 203.0.113.50 with a different spoofed XFF
+        r2 = self.client.post(
+            "/api/v1/agent/activation/exchange",
+            {"activation_code": "code2", "installation_id": "inst2"},
+            format="json",
+            REMOTE_ADDR="203.0.113.50",
+            HTTP_X_FORWARDED_FOR="2.2.2.2",
+        )
+        self.assertEqual(r2.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Request 3 from same REMOTE_ADDR with yet another spoofed XFF must be throttled (429)
+        r3 = self.client.post(
+            "/api/v1/agent/activation/exchange",
+            {"activation_code": "code3", "installation_id": "inst3"},
+            format="json",
+            REMOTE_ADDR="203.0.113.50",
+            HTTP_X_FORWARDED_FOR="3.3.3.3",
+        )
+        self.assertEqual(r3.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+        self.assertEqual(r3.data["code"], "rate_limited")
+
+        # Request 4 from genuinely different REMOTE_ADDR must NOT be throttled
+        r4 = self.client.post(
+            "/api/v1/agent/activation/exchange",
+            {"activation_code": "code4", "installation_id": "inst4"},
+            format="json",
+            REMOTE_ADDR="203.0.113.99",
+            HTTP_X_FORWARDED_FOR="1.1.1.1",
+        )
+        self.assertEqual(r4.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @override_settings(
+        REST_FRAMEWORK={
+            "DEFAULT_AUTHENTICATION_CLASSES": [],
+            "DEFAULT_PERMISSION_CLASSES": [],
+            "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
+            "DEFAULT_PARSER_CLASSES": ["rest_framework.parsers.JSONParser"],
+            "EXCEPTION_HANDLER": "apps.devices.exceptions.api_exception_handler",
+            "DEFAULT_THROTTLE_RATES": {"agent_activation": "10/minute", "agent_refresh": "2/minute"},
+            "NUM_PROXIES": 0,
+        },
+        DOCFLOW_TRUSTED_PROXIES=(),
+        DOCFLOW_NUM_PROXIES=0,
+    )
+    def test_untrusted_x_forwarded_for_cannot_bypass_refresh_throttling(self):
+        # Request 1 from 203.0.113.60
+        r1 = self.client.post(
+            "/api/v1/agent/auth/refresh",
+            {"refresh_token": "token1"},
+            format="json",
+            REMOTE_ADDR="203.0.113.60",
+            HTTP_X_FORWARDED_FOR="10.10.10.1",
+        )
+        self.assertEqual(r1.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        # Request 2 from 203.0.113.60 with spoofed XFF
+        r2 = self.client.post(
+            "/api/v1/agent/auth/refresh",
+            {"refresh_token": "token2"},
+            format="json",
+            REMOTE_ADDR="203.0.113.60",
+            HTTP_X_FORWARDED_FOR="10.10.10.2",
+        )
+        self.assertEqual(r2.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        # Request 3 from 203.0.113.60 with spoofed XFF must be throttled
+        r3 = self.client.post(
+            "/api/v1/agent/auth/refresh",
+            {"refresh_token": "token3"},
+            format="json",
+            REMOTE_ADDR="203.0.113.60",
+            HTTP_X_FORWARDED_FOR="10.10.10.3",
+        )
+        self.assertEqual(r3.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+        self.assertEqual(r3.data["code"], "rate_limited")
+
+    @override_settings(DOCFLOW_TRUSTED_PROXIES=("10.0.0.1",))
+    def test_direct_connection_ignores_forwarded_for_even_if_header_claims_trusted_ip(self):
+        # Direct connection from untrusted IP 198.51.100.5 claiming XFF of 10.0.0.1
+        class MockRequest:
+            META = {
+                "REMOTE_ADDR": "198.51.100.5",
+                "HTTP_X_FORWARDED_FOR": "10.0.0.1, 1.2.3.4",
+            }
+
+        resolved = get_client_ip(MockRequest())
+        self.assertEqual(resolved, "198.51.100.5")
+
+    @override_settings(DOCFLOW_TRUSTED_PROXIES=("10.0.0.1",))
+    def test_configured_trusted_proxy_accepts_forwarded_client_ip(self):
+        # Direct connection from trusted proxy 10.0.0.1 with forwarded client IP
+        class MockRequest:
+            META = {
+                "REMOTE_ADDR": "10.0.0.1",
+                "HTTP_X_FORWARDED_FOR": "203.0.113.45",
+            }
+
+        resolved = get_client_ip(MockRequest())
+        self.assertEqual(resolved, "203.0.113.45")
+
+    @override_settings(DOCFLOW_TRUSTED_PROXIES=("10.0.0.1", "10.0.0.2"))
+    def test_configured_trusted_proxy_chain_traversal_rejects_spoofed_hops(self):
+        # Client 203.0.113.45 sent spoofed XFF "1.1.1.1" through proxy chain 10.0.0.2 -> 10.0.0.1
+        class MockRequest:
+            META = {
+                "REMOTE_ADDR": "10.0.0.1",
+                "HTTP_X_FORWARDED_FOR": "1.1.1.1, 203.0.113.45, 10.0.0.2",
+            }
+
+        resolved = get_client_ip(MockRequest())
+        self.assertEqual(resolved, "203.0.113.45")
+
+    @override_settings(DOCFLOW_TRUSTED_PROXIES=("10.0.0.0/24",))
+    def test_configured_trusted_proxy_cidr_range_supported(self):
+        class MockRequest:
+            META = {
+                "REMOTE_ADDR": "10.0.0.15",
+                "HTTP_X_FORWARDED_FOR": "203.0.113.88",
+            }
+
+        resolved = get_client_ip(MockRequest())
+        self.assertEqual(resolved, "203.0.113.88")
+
+    @override_settings(DOCFLOW_TRUSTED_PROXIES=(), DOCFLOW_NUM_PROXIES=1)
+    def test_configured_num_proxies_resolves_appropriate_hop(self):
+        class MockRequest:
+            META = {
+                "REMOTE_ADDR": "127.0.0.1",
+                "HTTP_X_FORWARDED_FOR": "1.1.1.1, 203.0.113.77",
+            }
+
+        resolved = get_client_ip(MockRequest())
+        self.assertEqual(resolved, "203.0.113.77")
+
+    def test_invalid_and_malformed_ips_sanitized_to_remote_addr(self):
+        self.assertFalse(is_valid_ip(None))
+        self.assertFalse(is_valid_ip(""))
+        self.assertFalse(is_valid_ip("not-an-ip"))
+        self.assertFalse(is_valid_ip("999.999.999.999"))
+        self.assertFalse(is_valid_ip("192.168.1.1, 10.0.0.1"))
+        self.assertTrue(is_valid_ip("192.168.1.1"))
+        self.assertTrue(is_valid_ip("2001:db8::1"))
+
+        # Fallback to REMOTE_ADDR if XFF is gibberish
+        class MockRequest:
+            META = {
+                "REMOTE_ADDR": "203.0.113.10",
+                "HTTP_X_FORWARDED_FOR": "garbage-not-an-ip",
+            }
+
+        resolved = get_client_ip(MockRequest())
+        self.assertEqual(resolved, "203.0.113.10")
+
+    def test_drf_rate_throttle_get_ident_never_trusts_untrusted_xff(self):
+        class MockRequest:
+            META = {
+                "REMOTE_ADDR": "203.0.113.5",
+                "HTTP_X_FORWARDED_FOR": "1.2.3.4",
+            }
+
+        act_throttle = ActivationRateThrottle()
+        ref_throttle = RefreshRateThrottle()
+
+        req = MockRequest()
+        self.assertEqual(act_throttle.get_ident(req), "203.0.113.5")
+        self.assertEqual(ref_throttle.get_ident(req), "203.0.113.5")

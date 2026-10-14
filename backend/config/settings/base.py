@@ -118,4 +118,18 @@ REST_FRAMEWORK = {
         "agent_activation": "10/minute",
         "agent_refresh": "30/minute",
     },
+    "NUM_PROXIES": 0,
 }
+
+# ---------------------------------------------------------------------------
+# Reverse Proxy Trust Configuration
+# ---------------------------------------------------------------------------
+# By default, Docflow rejects arbitrary X-Forwarded-For headers and resolves
+# client IP strictly from the actual REMOTE_ADDR.
+# To support trusted reverse proxies, configure an explicit list of trusted
+# proxy IPs via DOCFLOW_TRUSTED_PROXIES (tuple/list of IP strings or CIDR).
+# When empty or 0, forwarded headers are completely ignored.
+NUM_PROXIES = 0
+DOCFLOW_NUM_PROXIES = 0
+DOCFLOW_TRUSTED_PROXIES = ()
+
