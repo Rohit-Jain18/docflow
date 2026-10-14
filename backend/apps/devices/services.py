@@ -23,7 +23,7 @@ from django.db import transaction
 from django.utils import timezone as tz_utils
 
 from apps.audit.models import AuditAction, AuditEvent
-from apps.devices.models import (
+from .models import (
     Device,
     DeviceActivationCode,
     DeviceRefreshCredential,

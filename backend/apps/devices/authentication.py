@@ -9,8 +9,8 @@ from django.core.exceptions import ValidationError
 from rest_framework.authentication import BaseAuthentication, get_authorization_header
 from rest_framework.exceptions import AuthenticationFailed
 
-from apps.devices.models import Device, DeviceStatus
-from apps.devices.services import verify_access_token
+from .models import Device, DeviceStatus
+from .services import verify_access_token
 
 
 class DeviceBearerAuthentication(BaseAuthentication):
