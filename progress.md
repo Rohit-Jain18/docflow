@@ -214,3 +214,28 @@
 - **Open issues/blockers:** None for Phase 1 Task 1. Remaining WhatsApp/media/credential open questions (OQ-001 through OQ-010) are deferred to Phase 3+.
 - **Next step:** Phase 1 Task 1 complete. Awaiting approval to proceed to Phase 1 Task 2 (remaining models: Organization, Lab, Branch, Device, WhatsApp account, Report, Outbox, etc.).
 
+## 2026-10-14T21:05:00+05:30 — Phase 1 Task 2A: Core Tenancy Models
+
+- **Phase / task:** Phase 1 / Task 2A — Core Tenancy Models (Organization, OrganizationMembership, Lab, Branch), migrations, admin registration, tenant safety validation, unit tests.
+- **Goal:** Implement minimal core tenancy abstractions with UUID PKs, uniqueness constraints, role/status choices, and robust cross-tenant consistency validation (branch's lab must belong to branch's organization on save) without unnecessary database queries.
+- **Inspection:** Inspected Git status, CLAUDE.md, backend/config/settings/base.py, apps/users/models.py, docs/DATA_MODEL.md, docs/RULES.md, docs/SECURITY.md.
+- **Changes:**
+  - `backend/config/settings/base.py`: Registered `apps.tenants` in `INSTALLED_APPS`.
+  - `backend/apps/tenants/__init__.py`: Package init.
+  - `backend/apps/tenants/apps.py`: TenantsConfig AppConfig.
+  - `backend/apps/tenants/models.py`: Created `Organization` (UUID PK, name, unique slug, status choices, timezone, created_by FK, timestamps), `OrganizationMembership` (UUID PK, organization FK, user FK, role choices, status choices, timestamps, unique constraint on org + user), `Lab` (UUID PK, organization FK, name, code unique per organization, default diagnostic lab_type, support phone, status choices, timestamps), and `Branch` (UUID PK, organization FK, lab FK, name, code unique per lab, address, support phone, timezone, status choices, timestamps, cross-tenant consistency validation in `clean()` and `save()`).
+  - `backend/apps/tenants/admin.py`: Registered `OrganizationAdmin`, `OrganizationMembershipAdmin`, `LabAdmin`, and `BranchAdmin` with search, filter, and readonly timestamp fields.
+  - `backend/apps/tenants/migrations/0001_initial.py`: Migration generated and applied cleanly against development SQLite database.
+  - `backend/tests/test_tenant_models.py`: 29 unit tests covering model creation, UUID PKs, slug uniqueness, membership uniqueness, role/status choices, lab code scoping, branch code scoping, cascade deletion behaviors, and tenant safety invariants.
+- **Why:** Establish tenant boundary models per DATA_MODEL.md §1 and enforce Rule 1 (tenant isolation). Prevent cross-tenant branch misconfigurations even on direct ORM `save()` or `create()` calls without degrading partial updates.
+- **Commands run:**
+  - `& "...\backend\.venv\Scripts\python.exe" manage.py check --settings=config.settings.development` — System check identified no issues (0 silenced).
+  - `& "...\backend\.venv\Scripts\python.exe" manage.py makemigrations tenants --settings=config.settings.development` — Created `apps/tenants/migrations/0001_initial.py`.
+  - `& "...\backend\.venv\Scripts\python.exe" manage.py migrate --settings=config.settings.development` — Applied `tenants.0001_initial` OK.
+  - `& "...\backend\.venv\Scripts\python.exe" manage.py test tests --settings=config.settings.development --verbosity=2` — Ran 68 tests in 23.615s — OK.
+- **Tests/checks:** 68 tests run (39 existing + 29 new tenant tests), 0 failures. System check 0 issues.
+- **Security/reliability checks:** Cross-organization branch creation (`branch.lab.organization != branch.organization`) is rejected with `ValidationError` on `save()`, `create()`, and `full_clean()`; `save(update_fields=['status'])` does not trigger redundant queries; unique constraints prevent duplicate slugs, duplicate memberships, duplicate lab codes per org, and duplicate branch codes per lab.
+- **Decisions:** Branch code uniqueness is scoped to its lab (`unique_lab_branch_code`); `created_by` on `Organization` uses `SET_NULL`; `clean()` and `save()` enforce tenant consistency across normal model persistence.
+- **Open issues/blockers:** None for Task 2A. External WhatsApp contracts (OQ-001–OQ-010) remain deferred to Phase 3+.
+- **Next step:** Phase 1 Task 2A complete. Awaiting approval for Phase 1 Task 2B (Device & activation models, or next planned model batch).
+

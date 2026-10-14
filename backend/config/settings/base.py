@@ -26,6 +26,7 @@ INSTALLED_APPS = [
     "rest_framework",
     # Docflow apps
     "apps.users",
+    "apps.tenants",
 ]
 
 MIDDLEWARE = [
