@@ -77,3 +77,22 @@ class RefreshRateThrottle(SafeIPRateThrottle):
             return rates[self.scope]
         return self.THROTTLE_RATES.get(self.scope, self.default_rate)
 
+
+class UserLoginRateThrottle(SafeIPRateThrottle):
+    """
+    IP-based rate throttle for POST /api/v1/auth/login.
+    Configured via REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"]["user_login"].
+    Uses hardened client IP resolution policy (never trusts spoofed headers).
+    """
+
+    scope = "user_login"
+    default_rate = "5/minute"
+
+    def get_rate(self):
+        rf_settings = getattr(settings, "REST_FRAMEWORK", {})
+        rates = rf_settings.get("DEFAULT_THROTTLE_RATES", {})
+        if self.scope in rates:
+            return rates[self.scope]
+        return self.THROTTLE_RATES.get(self.scope, self.default_rate)
+
+

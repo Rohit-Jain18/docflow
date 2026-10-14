@@ -117,9 +117,18 @@ REST_FRAMEWORK = {
     "DEFAULT_THROTTLE_RATES": {
         "agent_activation": "10/minute",
         "agent_refresh": "30/minute",
+        "user_login": "5/minute",
     },
     "NUM_PROXIES": 0,
 }
+
+# ---------------------------------------------------------------------------
+# Session & CSRF Cookie Security
+# ---------------------------------------------------------------------------
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = "Lax"
+CSRF_COOKIE_HTTPONLY = False
+CSRF_COOKIE_SAMESITE = "Lax"
 
 # ---------------------------------------------------------------------------
 # Reverse Proxy Trust Configuration
@@ -133,4 +142,5 @@ REST_FRAMEWORK = {
 NUM_PROXIES = 0
 DOCFLOW_NUM_PROXIES = 0
 DOCFLOW_TRUSTED_PROXIES = ()
+
 
