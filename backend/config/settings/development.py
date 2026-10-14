@@ -6,7 +6,17 @@ Do NOT use in staging or production.
 """
 
 import os
+from django.core.exceptions import ImproperlyConfigured
 from .base import *  # noqa: F401, F403
+
+# ---------------------------------------------------------------------------
+# Reject production environment using development settings
+# ---------------------------------------------------------------------------
+if os.environ.get("DOCFLOW_ENV", "").lower() == "production":
+    raise ImproperlyConfigured(
+        "[Docflow] DOCFLOW_ENV=production is set but development settings are "
+        "active. Use config.settings.production for production deployments."
+    )
 
 # ---------------------------------------------------------------------------
 # Core

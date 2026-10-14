@@ -7,13 +7,17 @@ variable under test so failures are unambiguous.
 
 Covers:
 - Missing DJANGO_SECRET_KEY raises ImproperlyConfigured
+- Development placeholder secret key raises ImproperlyConfigured
 - DEBUG=true in production raises ImproperlyConfigured
 - Missing DATABASE_URL raises ImproperlyConfigured
 - SQLite DATABASE_URL raises ImproperlyConfigured
-- Non-PostgreSQL DATABASE_URL raises ImproperlyConfigured
+- Non-PostgreSQL DATABASE_URL (MySQL) raises ImproperlyConfigured
 - DEV_ACCOUNT_VERIFICATION_OVERRIDE=true raises ImproperlyConfigured
 - TEMP_UPLOAD_MODE != disabled raises ImproperlyConfigured
 - Valid PostgreSQL DATABASE_URL succeeds without raising
+- Empty ALLOWED_HOSTS raises ImproperlyConfigured
+- Wildcard ALLOWED_HOSTS raises ImproperlyConfigured
+- DOCFLOW_ENV=production with development settings raises ImproperlyConfigured
 """
 
 import importlib
@@ -182,3 +186,102 @@ class ProductionSettingsValidationTest(unittest.TestCase):
             self._load(DJANGO_SECRET_KEY="")
         # Message must not echo the (empty) value — check no raw value leakage pattern
         self.assertNotIn("=", str(ctx.exception).split("'DJANGO_SECRET_KEY'")[-1][:20])
+
+    # ------------------------------------------------------------------
+    # Secret key placeholder detection
+    # ------------------------------------------------------------------
+
+    def test_dev_placeholder_secret_raises(self):
+        from django.core.exceptions import ImproperlyConfigured
+        with self.assertRaises(ImproperlyConfigured):
+            self._load(DJANGO_SECRET_KEY="dev-insecure-secret-key-change-before-production")
+
+    def test_insecure_placeholder_secret_raises(self):
+        from django.core.exceptions import ImproperlyConfigured
+        with self.assertRaises(ImproperlyConfigured):
+            self._load(DJANGO_SECRET_KEY="django-insecure-abc123")
+
+    def test_strong_secret_key_does_not_raise(self):
+        from django.core.exceptions import ImproperlyConfigured
+        try:
+            self._load(DJANGO_SECRET_KEY="a-sufficiently-long-production-secret-key-placeholder")
+        except ImproperlyConfigured as exc:
+            self.fail(f"Strong key raised: {exc}")
+
+    # ------------------------------------------------------------------
+    # ALLOWED_HOSTS validation
+    # ------------------------------------------------------------------
+
+    def test_wildcard_allowed_hosts_raises(self):
+        from django.core.exceptions import ImproperlyConfigured
+        with self.assertRaises(ImproperlyConfigured):
+            self._load(DJANGO_ALLOWED_HOSTS="*")
+
+    def test_wildcard_in_list_raises(self):
+        from django.core.exceptions import ImproperlyConfigured
+        with self.assertRaises(ImproperlyConfigured):
+            self._load(DJANGO_ALLOWED_HOSTS="app.example.com,*")
+
+    def test_specific_allowed_hosts_does_not_raise(self):
+        from django.core.exceptions import ImproperlyConfigured
+        try:
+            self._load(DJANGO_ALLOWED_HOSTS="app.example.com,api.example.com")
+        except ImproperlyConfigured as exc:
+            self.fail(f"Specific hosts raised: {exc}")
+
+    # ------------------------------------------------------------------
+    # Non-PostgreSQL DATABASE_URL
+    # ------------------------------------------------------------------
+
+    def test_mysql_database_url_raises(self):
+        from django.core.exceptions import ImproperlyConfigured
+        with self.assertRaises(ImproperlyConfigured):
+            self._load(DATABASE_URL="mysql://user:pass@db:3306/docflow")
+
+
+def _import_development_settings(env_overrides: dict) -> None:
+    """Re-import development settings with patched environment."""
+    for key in list(sys.modules):
+        if key.startswith("config.settings"):
+            del sys.modules[key]
+
+    old_env = {}
+    for k, v in env_overrides.items():
+        old_env[k] = os.environ.get(k)
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+    try:
+        importlib.import_module("config.settings.development")
+    finally:
+        for k, old_v in old_env.items():
+            if old_v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old_v
+
+
+class DevelopmentSettingsGuardTest(unittest.TestCase):
+    """Development settings must reject DOCFLOW_ENV=production."""
+
+    def test_docflow_env_production_with_dev_settings_raises(self):
+        from django.core.exceptions import ImproperlyConfigured
+        with self.assertRaises(ImproperlyConfigured):
+            _import_development_settings({"DOCFLOW_ENV": "production"})
+
+    def test_docflow_env_development_does_not_raise(self):
+        from django.core.exceptions import ImproperlyConfigured
+        try:
+            _import_development_settings({"DOCFLOW_ENV": "development"})
+        except ImproperlyConfigured as exc:
+            self.fail(f"DOCFLOW_ENV=development raised: {exc}")
+
+    def test_docflow_env_unset_does_not_raise(self):
+        from django.core.exceptions import ImproperlyConfigured
+        try:
+            _import_development_settings({"DOCFLOW_ENV": None})
+        except ImproperlyConfigured as exc:
+            self.fail(f"Unset DOCFLOW_ENV raised: {exc}")
+

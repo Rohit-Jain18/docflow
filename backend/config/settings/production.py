@@ -32,6 +32,19 @@ def _require_env(name: str) -> str:
 # ---------------------------------------------------------------------------
 SECRET_KEY = _require_env("DJANGO_SECRET_KEY")
 
+# Reject known development placeholder values — match the string used in development.py
+_DEV_PLACEHOLDER_SECRETS = {
+    "dev-insecure-secret-key-change-before-production",
+    "insecure",
+    "changeme",
+    "django-insecure",
+}
+if any(placeholder in SECRET_KEY for placeholder in _DEV_PLACEHOLDER_SECRETS):
+    raise ImproperlyConfigured(
+        "[Docflow] DJANGO_SECRET_KEY appears to be a development placeholder. "
+        "Set a strong unique secret before starting the production server."
+    )
+
 DEBUG_RAW = os.environ.get("DJANGO_DEBUG", "false").lower()
 if DEBUG_RAW not in ("false", "0", ""):
     raise ImproperlyConfigured(
@@ -42,6 +55,17 @@ DEBUG = False
 
 _allowed_hosts_raw = _require_env("DJANGO_ALLOWED_HOSTS")
 ALLOWED_HOSTS = [h.strip() for h in _allowed_hosts_raw.split(",") if h.strip()]
+
+# Reject wildcard — an open host header allows header injection in production
+if not ALLOWED_HOSTS:
+    raise ImproperlyConfigured(
+        "[Docflow] DJANGO_ALLOWED_HOSTS must not be empty in production."
+    )
+if "*" in ALLOWED_HOSTS:
+    raise ImproperlyConfigured(
+        "[Docflow] DJANGO_ALLOWED_HOSTS must not contain '*' in production. "
+        "List explicit hostnames."
+    )
 
 # ---------------------------------------------------------------------------
 # CSRF / session cookie security
