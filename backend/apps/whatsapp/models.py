@@ -242,9 +242,38 @@ class BranchWhatsAppAssignment(models.Model):
         return f"{self.branch.name} -> {self.whatsapp_account} ({self.status})"
 
     def clean(self) -> None:
-        """Validate mutual organization consistency between branch and account."""
+        """Validate immutability of identity relationships and mutual tenant consistency."""
         super().clean()
+        self._validate_immutability()
         self._validate_tenant_consistency()
+
+    def _validate_immutability(self) -> None:
+        """
+        Ensure persisted BranchWhatsAppAssignment identity relationships
+        (organization, branch, whatsapp_account) cannot be changed after creation.
+        """
+        if not self._state.adding and self.pk:
+            original = (
+                BranchWhatsAppAssignment.objects.filter(pk=self.pk)
+                .values("organization_id", "branch_id", "whatsapp_account_id")
+                .first()
+            )
+            if original:
+                errors = {}
+                if original["organization_id"] != self.organization_id:
+                    errors["organization"] = (
+                        "The organization of a persisted assignment cannot be changed."
+                    )
+                if original["branch_id"] != self.branch_id:
+                    errors["branch"] = (
+                        "The branch of a persisted assignment cannot be changed."
+                    )
+                if original["whatsapp_account_id"] != self.whatsapp_account_id:
+                    errors["whatsapp_account"] = (
+                        "The WhatsApp account of a persisted assignment cannot be changed."
+                    )
+                if errors:
+                    raise ValidationError(errors)
 
     def _validate_tenant_consistency(self) -> None:
         """
@@ -285,20 +314,23 @@ class BranchWhatsAppAssignment(models.Model):
             raise ValidationError(errors)
 
     def save(self, *args, **kwargs) -> None:
-        """Enforce tenant consistency on normal saves."""
+        """Enforce immutability and tenant consistency on normal saves."""
         update_fields = kwargs.get("update_fields")
+        identity_fields = {
+            "organization",
+            "organization_id",
+            "branch",
+            "branch_id",
+            "whatsapp_account",
+            "whatsapp_account_id",
+        }
         if update_fields is None:
+            self._validate_immutability()
             self._validate_tenant_consistency()
         else:
-            tenant_fields = {
-                "organization",
-                "organization_id",
-                "branch",
-                "branch_id",
-                "whatsapp_account",
-                "whatsapp_account_id",
-            }
-            if tenant_fields.intersection(update_fields):
+            if identity_fields.intersection(update_fields):
+                self._validate_immutability()
                 self._validate_tenant_consistency()
 
         super().save(*args, **kwargs)
+

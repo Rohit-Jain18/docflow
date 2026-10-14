@@ -300,3 +300,135 @@ class BranchWhatsAppAssignmentModelTest(TestCase):
         self.assertIn("branch", admin.list_display)
         self.assertIn("whatsapp_account", admin.list_display)
         self.assertIn("status", admin.list_display)
+
+    def test_persisted_assignment_organization_cannot_be_changed(self):
+        """Changing the organization of a persisted assignment must raise ValidationError."""
+        assignment = BranchWhatsAppAssignment.objects.create(
+            organization=self.org_a,
+            branch=self.branch_a,
+            whatsapp_account=self.account_a1,
+        )
+        assignment.organization = self.org_b
+        with self.assertRaises(ValidationError) as ctx:
+            assignment.save()
+        self.assertIn("organization", ctx.exception.message_dict)
+
+        with self.assertRaises(ValidationError) as ctx:
+            assignment.full_clean()
+        self.assertIn("organization", ctx.exception.message_dict)
+
+        assignment.refresh_from_db()
+        self.assertEqual(assignment.organization, self.org_a)
+
+    def test_persisted_assignment_branch_cannot_be_changed(self):
+        """Changing the branch of a persisted assignment must raise ValidationError."""
+        branch_a2 = Branch.objects.create(
+            organization=self.org_a,
+            lab=self.lab_a,
+            name="Branch A2",
+            code="BA2",
+        )
+        assignment = BranchWhatsAppAssignment.objects.create(
+            organization=self.org_a,
+            branch=self.branch_a,
+            whatsapp_account=self.account_a1,
+        )
+        assignment.branch = branch_a2
+        with self.assertRaises(ValidationError) as ctx:
+            assignment.save()
+        self.assertIn("branch", ctx.exception.message_dict)
+
+        with self.assertRaises(ValidationError) as ctx:
+            assignment.full_clean()
+        self.assertIn("branch", ctx.exception.message_dict)
+
+        assignment.refresh_from_db()
+        self.assertEqual(assignment.branch, self.branch_a)
+
+    def test_persisted_assignment_whatsapp_account_cannot_be_changed(self):
+        """Changing the WhatsApp account of a persisted assignment must raise ValidationError."""
+        assignment = BranchWhatsAppAssignment.objects.create(
+            organization=self.org_a,
+            branch=self.branch_a,
+            whatsapp_account=self.account_a1,
+        )
+        assignment.whatsapp_account = self.account_a2
+        with self.assertRaises(ValidationError) as ctx:
+            assignment.save()
+        self.assertIn("whatsapp_account", ctx.exception.message_dict)
+
+        with self.assertRaises(ValidationError) as ctx:
+            assignment.full_clean()
+        self.assertIn("whatsapp_account", ctx.exception.message_dict)
+
+        assignment.refresh_from_db()
+        self.assertEqual(assignment.whatsapp_account, self.account_a1)
+
+    def test_persisted_assignment_multiple_relationship_changes_reported(self):
+        """Changing multiple identity fields reports all corresponding validation errors."""
+        branch_a2 = Branch.objects.create(
+            organization=self.org_a,
+            lab=self.lab_a,
+            name="Branch A3",
+            code="BA3",
+        )
+        assignment = BranchWhatsAppAssignment.objects.create(
+            organization=self.org_a,
+            branch=self.branch_a,
+            whatsapp_account=self.account_a1,
+        )
+        assignment.branch = branch_a2
+        assignment.whatsapp_account = self.account_a2
+        with self.assertRaises(ValidationError) as ctx:
+            assignment.clean()
+        self.assertIn("branch", ctx.exception.message_dict)
+        self.assertIn("whatsapp_account", ctx.exception.message_dict)
+
+    def test_lifecycle_updates_allowed_on_persisted_assignment(self):
+        """Legitimate lifecycle transitions (e.g. status and ended_at) must succeed."""
+        now = tz_utils.now()
+        assignment = BranchWhatsAppAssignment.objects.create(
+            organization=self.org_a,
+            branch=self.branch_a,
+            whatsapp_account=self.account_a1,
+            status=AssignmentStatus.ACTIVE,
+        )
+        # Normal save update
+        assignment.status = AssignmentStatus.INACTIVE
+        assignment.ended_at = now
+        assignment.full_clean()
+        assignment.save()
+
+        assignment.refresh_from_db()
+        self.assertEqual(assignment.status, AssignmentStatus.INACTIVE)
+        self.assertEqual(assignment.ended_at, now)
+
+        # Update with update_fields
+        assignment.status = AssignmentStatus.ACTIVE
+        assignment.ended_at = None
+        assignment.save(update_fields=["status", "ended_at"])
+
+        assignment.refresh_from_db()
+        self.assertEqual(assignment.status, AssignmentStatus.ACTIVE)
+        self.assertIsNone(assignment.ended_at)
+
+    def test_admin_relationship_fields_readonly_on_edit(self):
+        """Relationship fields are editable on creation, but read-only when editing."""
+        site = AdminSite()
+        admin = BranchWhatsAppAssignmentAdmin(BranchWhatsAppAssignment, site)
+        assignment = BranchWhatsAppAssignment.objects.create(
+            organization=self.org_a,
+            branch=self.branch_a,
+            whatsapp_account=self.account_a1,
+        )
+
+        readonly_create = admin.get_readonly_fields(request=None, obj=None)
+        self.assertNotIn("organization", readonly_create)
+        self.assertNotIn("branch", readonly_create)
+        self.assertNotIn("whatsapp_account", readonly_create)
+
+        readonly_edit = admin.get_readonly_fields(request=None, obj=assignment)
+        self.assertIn("organization", readonly_edit)
+        self.assertIn("branch", readonly_edit)
+        self.assertIn("whatsapp_account", readonly_edit)
+

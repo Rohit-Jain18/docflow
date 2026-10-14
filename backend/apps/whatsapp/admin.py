@@ -51,3 +51,9 @@ class BranchWhatsAppAssignmentAdmin(admin.ModelAdmin):
     )
     ordering = ("-assigned_at",)
     readonly_fields = ("id", "assigned_at")
+
+    def get_readonly_fields(self, request, obj=None):
+        if obj:
+            return self.readonly_fields + ("organization", "branch", "whatsapp_account")
+        return self.readonly_fields
+
