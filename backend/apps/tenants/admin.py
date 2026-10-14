@@ -30,6 +30,11 @@ class LabAdmin(admin.ModelAdmin):
     ordering = ("organization", "name")
     readonly_fields = ("id", "created_at", "updated_at")
 
+    def get_readonly_fields(self, request, obj=None):
+        if obj:
+            return self.readonly_fields + ("organization",)
+        return self.readonly_fields
+
 
 @admin.register(Branch)
 class BranchAdmin(admin.ModelAdmin):

@@ -169,6 +169,81 @@ class LabModelTest(TestCase):
         self.org.delete()
         self.assertEqual(Lab.objects.count(), 0)
 
+    def test_persisted_lab_organization_cannot_be_changed_via_save(self):
+        org2 = Organization.objects.create(name="Beta", slug="beta")
+        lab = Lab.objects.create(organization=self.org, name="Lab 1", code="CODE1")
+        branch = Branch.objects.create(
+            organization=self.org, lab=lab, name="Branch 1", code="BR-1"
+        )
+
+        lab.organization = org2
+        with self.assertRaises(ValidationError) as ctx:
+            lab.save()
+        self.assertIn("organization", ctx.exception.message_dict)
+
+        # Verify DB is unchanged and branch remains consistent with lab
+        lab.refresh_from_db()
+        branch.refresh_from_db()
+        self.assertEqual(lab.organization, self.org)
+        self.assertEqual(branch.organization, self.org)
+        self.assertEqual(branch.lab.organization, self.org)
+
+    def test_persisted_lab_organization_cannot_be_changed_via_raw_id(self):
+        org2 = Organization.objects.create(name="Beta", slug="beta")
+        lab = Lab.objects.create(organization=self.org, name="Lab 1", code="CODE1")
+
+        lab.organization_id = org2.id
+        with self.assertRaises(ValidationError) as ctx:
+            lab.save()
+        self.assertIn("organization", ctx.exception.message_dict)
+
+        lab.refresh_from_db()
+        self.assertEqual(lab.organization, self.org)
+
+    def test_persisted_lab_organization_cannot_be_changed_via_update_fields(self):
+        org2 = Organization.objects.create(name="Beta", slug="beta")
+        lab = Lab.objects.create(organization=self.org, name="Lab 1", code="CODE1")
+
+        lab.organization = org2
+        with self.assertRaises(ValidationError) as ctx:
+            lab.save(update_fields=["organization"])
+        self.assertIn("organization", ctx.exception.message_dict)
+
+        lab.refresh_from_db()
+        self.assertEqual(lab.organization, self.org)
+
+    def test_persisted_lab_organization_cannot_be_changed_via_full_clean(self):
+        org2 = Organization.objects.create(name="Beta", slug="beta")
+        lab = Lab.objects.create(organization=self.org, name="Lab 1", code="CODE1")
+
+        lab.organization = org2
+        with self.assertRaises(ValidationError) as ctx:
+            lab.full_clean()
+        self.assertIn("organization", ctx.exception.message_dict)
+
+    def test_normal_update_to_persisted_lab_succeeds(self):
+        lab = Lab.objects.create(organization=self.org, name="Lab 1", code="CODE1")
+        lab.name = "Renamed Lab"
+        lab.support_phone = "+1-555-0100"
+        lab.save()
+        lab.refresh_from_db()
+        self.assertEqual(lab.name, "Renamed Lab")
+        self.assertEqual(lab.support_phone, "+1-555-0100")
+
+    def test_lab_admin_organization_readonly_on_existing_instance(self):
+        from apps.tenants.admin import LabAdmin
+        from django.contrib.admin.sites import AdminSite
+
+        site = AdminSite()
+        admin = LabAdmin(Lab, site)
+        lab = Lab.objects.create(organization=self.org, name="Lab 1", code="CODE1")
+
+        readonly_create = admin.get_readonly_fields(request=None, obj=None)
+        self.assertNotIn("organization", readonly_create)
+
+        readonly_change = admin.get_readonly_fields(request=None, obj=lab)
+        self.assertIn("organization", readonly_change)
+
 
 class BranchModelTest(TestCase):
     def setUp(self):

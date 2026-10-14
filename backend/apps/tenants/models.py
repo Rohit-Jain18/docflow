@@ -208,6 +208,46 @@ class Lab(models.Model):
     def __str__(self) -> str:
         return f"{self.name} ({self.code})"
 
+    def clean(self) -> None:
+        """Validate model invariants including organization immutability."""
+        super().clean()
+        self._validate_organization_immutability()
+
+    def _validate_organization_immutability(self) -> None:
+        """
+        Ensure a persisted lab's organization cannot be changed.
+
+        A lab's organization is its tenant boundary. Allowing it to change
+        risks tenant isolation and can leave child branches inconsistent.
+        """
+        if not self._state.adding and self.pk:
+            original_org_id = (
+                Lab.objects.filter(pk=self.pk)
+                .values_list("organization_id", flat=True)
+                .first()
+            )
+            if original_org_id and original_org_id != self.organization_id:
+                raise ValidationError(
+                    {"organization": "The organization of a persisted lab cannot be changed."}
+                )
+
+    def save(self, *args, **kwargs) -> None:
+        """
+        Save the lab instance, enforcing organization immutability.
+
+        Django models do not run clean() automatically on save(). We enforce
+        immutability on normal saves and when update_fields touches organization.
+        """
+        update_fields = kwargs.get("update_fields")
+        if update_fields is None:
+            self._validate_organization_immutability()
+        else:
+            tenant_fields = {"organization", "organization_id"}
+            if tenant_fields.intersection(update_fields):
+                self._validate_organization_immutability()
+
+        super().save(*args, **kwargs)
+
 
 class BranchStatus(models.TextChoices):
     ACTIVE = "active", "Active"
