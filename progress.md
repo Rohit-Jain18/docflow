@@ -316,3 +316,29 @@
 - **Open issues/blockers:** None for Task 2D. Production media encryption/direct upload and status webhooks (OQ-001 through OQ-010) remain deferred to future phases.
 - **Next step:** Phase 1 Task 2D complete. Awaiting approval to proceed to Phase 1 Task 3 (or next planned task).
 
+## 2026-10-14T22:25:00+05:30 — Phase 1 Task 2E: AuditEvent and WebhookReceipt
+
+- **Phase / task:** Phase 1 / Task 2E — AuditEvent and WebhookReceipt models, migrations, admin registration, and unit tests.
+- **Goal:** Implement append-only `AuditEvent` with strict metadata allowlist, bounded scalar values, actor-device tenant consistency, and platform-level gating; implement `WebhookReceipt` with provider-scoped duplicate suppression and immutable event identity per DATA_MODEL.md §5 and SECURITY.md §§ 2, 7, 8.
+- **Inspection:** Inspected Git status, revision alignment, CLAUDE.md, backend/config/settings/base.py, existing domain models, docs/DATA_MODEL.md §5, docs/SECURITY.md §§ 2, 7, 8, and docs/OPEN_QUESTIONS.md.
+- **Changes:**
+  - `backend/config/settings/base.py`: Registered `apps.audit` in `INSTALLED_APPS`.
+  - `backend/apps/audit/__init__.py`: Package init.
+  - `backend/apps/audit/apps.py`: AuditConfig AppConfig (`name = "apps.audit"`, `label = "audit"`).
+  - `backend/apps/audit/models.py`: Created `AuditEvent` (UUID PK, nullable organization FK only for platform actions, optional actor_user and actor_device FKs, action choices covering device/account/role/delivery/security/platform actions, target_type, target_id, request_id, timestamp, safe_metadata JSON field with strict allowlisted keys, bounded scalar values, defense-in-depth content inspection rejecting URLs, PDF headers, tokens, raw payloads, and phone numbers, actor-device tenant consistency validation, append-only model and QuerySet immutability) and `WebhookReceipt` (UUID PK, provider_key, external_event_key, received_at, optional processed_at, processing_state choices, safe_error_code, unique constraint on `(provider_key, external_event_key)`, indexes on processing_state/received_at, event identity immutability on update, and legitimate processing-state lifecycle updates).
+  - `backend/apps/audit/admin.py`: Registered `AuditEventAdmin` (append-only: no add, no edit, no delete, all fields read-only) and `WebhookReceiptAdmin` (no delete, identity fields read-only on edit).
+  - `backend/apps/audit/migrations/0001_initial.py`: Migration generated and applied cleanly against development SQLite database.
+  - `backend/tests/test_audit_models.py`: 33 unit tests covering model creation, UUID PKs, platform-level organization gating, actor-device cross-tenant mismatch rejection, metadata allowlist enforcement, snake_case key validation, scalar type bounding, value content security checks (PDF, URL, token, JSON payload, phone number), append-only model/QuerySet immutability, webhook receipt uniqueness and identity immutability, processing-state transitions, and admin permissions.
+- **Why:** Establish tamper-resistant audit trail foundation and provider callback duplicate suppression records without storing sensitive payloads, tokens, or PII.
+- **Commands run:**
+  - `python manage.py check --settings=config.settings.development` — System check identified no issues (0 silenced).
+  - `python manage.py makemigrations audit --settings=config.settings.development` — Created `apps/audit/migrations/0001_initial.py`.
+  - `python manage.py migrate audit --settings=config.settings.development` — Applied `audit.0001_initial` OK.
+  - `.\.venv\Scripts\python.exe manage.py makemigrations --check --settings=config.settings.development` — No changes detected.
+  - `.\.venv\Scripts\python.exe manage.py test tests --settings=config.settings.development` — Ran 201 tests in 68.645s — OK.
+- **Tests/checks:** 201 tests run (14 user + 25 config + 35 tenant + 25 device + 24 whatsapp + 45 reports + 33 audit), 0 failures, 0 errors. System check 0 issues. `makemigrations --check` clean.
+- **Security/reliability checks:** Audit records are strictly append-only (edits and deletions blocked in model and QuerySet); metadata rejects unknown keys, nested objects, non-scalar values, oversized strings, and inspected sensitive values (URLs, PDFs, tokens, raw payloads, patient phone numbers); organization is required for tenant actions and permitted to be null only for explicit platform actions; actor-device tenant consistency is enforced; webhook receipts enforce provider-scoped uniqueness with immutable event identity.
+- **Decisions:** Created `apps.audit` for DATA_MODEL.md §5 models (`AuditEvent`, `WebhookReceipt`); audit records use custom Manager/QuerySet to block bulk update/delete operations; safe metadata enforces both allowlisted key names and content inspection of string values.
+- **Open issues/blockers:** None for Task 2E. Provider callback signatures, webhook endpoints, and external event schemas remain unconfirmed per OQ-005.
+- **Next step:** Phase 1 Task 2E complete. Awaiting approval to proceed to next task.
+

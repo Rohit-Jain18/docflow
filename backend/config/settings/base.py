@@ -30,6 +30,7 @@ INSTALLED_APPS = [
     "apps.devices",
     "apps.whatsapp",
     "apps.reports",
+    "apps.audit",
 ]
 
 MIDDLEWARE = [
