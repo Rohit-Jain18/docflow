@@ -671,3 +671,56 @@ def rotate_refresh_token(
         raise failure_error
 
     return result
+
+
+def revoke_device(
+    device: Device,
+    request_id: str = "",
+    ip_address: Optional[str] = None,
+    reason: str = "Device self-revoked",
+) -> None:
+    """
+    Atomically revoke a device and all its outstanding refresh credentials.
+
+    Enforces:
+      - Single transaction.atomic() with row lock on the device.
+      - Transitions device status to REVOKED and sets revoked_at timestamp.
+      - Revokes all outstanding refresh credentials for the device.
+      - Emits AuditAction.DEVICE_REVOKED audit event with safe metadata.
+    """
+    now = tz_utils.now()
+
+    with transaction.atomic():
+        dev = Device.objects.select_for_update().get(id=device.id)
+
+        # 1. Revoke all active refresh credentials for this device
+        DeviceRefreshCredential.objects.filter(
+            device=dev,
+            revoked_at__isnull=True,
+        ).update(revoked_at=now)
+
+        # 2. Update device status to REVOKED
+        dev.status = DeviceStatus.REVOKED
+        dev.revoked_at = now
+        dev.last_seen_at = now
+        if ip_address:
+            dev.last_ip = ip_address
+        dev.save(update_fields=["status", "revoked_at", "last_seen_at", "last_ip", "updated_at"])
+
+        # 3. Emit safe audit event
+        AuditEvent.objects.create(
+            organization=dev.organization,
+            actor_device=dev,
+            action=AuditAction.DEVICE_REVOKED,
+            target_type="device",
+            target_id=str(dev.id),
+            request_id=request_id,
+            safe_metadata={
+                "device_name": dev.name,
+                "device_id": str(dev.id),
+                "branch_id": str(dev.branch_id),
+                "reason": reason,
+                "status": DeviceStatus.REVOKED,
+            },
+        )
+

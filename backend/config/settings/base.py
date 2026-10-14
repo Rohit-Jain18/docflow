@@ -34,6 +34,7 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    "apps.devices.middleware.DocflowRequestIDMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -112,4 +113,9 @@ REST_FRAMEWORK = {
     "DEFAULT_PARSER_CLASSES": [
         "rest_framework.parsers.JSONParser",
     ],
+    "EXCEPTION_HANDLER": "apps.devices.exceptions.api_exception_handler",
+    "DEFAULT_THROTTLE_RATES": {
+        "agent_activation": "10/minute",
+        "agent_refresh": "30/minute",
+    },
 }
