@@ -28,6 +28,7 @@ INSTALLED_APPS = [
     "apps.users",
     "apps.tenants",
     "apps.devices",
+    "apps.whatsapp",
 ]
 
 MIDDLEWARE = [

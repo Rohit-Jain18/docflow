@@ -264,3 +264,28 @@
 - **Open issues/blockers:** None for Task 2B. External WhatsApp contracts (OQ-001–OQ-010) remain deferred to Phase 3+.
 - **Next step:** Phase 1 Task 2B complete. Awaiting approval for Phase 1 Task 2C (WhatsApp account & assignment models, or next planned model batch).
 
+## 2026-10-14T21:35:00+05:30 — Phase 1 Task 2C: WhatsApp Account and Branch Assignment Models
+
+- **Phase / task:** Phase 1 / Task 2C — WhatsAppAccount and BranchWhatsAppAssignment models, migrations, admin registration, tenant consistency validation, single-active-assignment constraint, and unit tests.
+- **Goal:** Implement WhatsApp account and branch assignment abstractions per DATA_MODEL.md §3, SECURITY.md §4, and OPEN_QUESTIONS.md OQ-003/OQ-004, ensuring mutual tenant consistency, preserving assignment history, enforcing at most one active sender per branch via a database constraint, and protecting opaque credential secret references.
+- **Inspection:** Inspected Git status, CLAUDE.md, backend/config/settings/base.py, apps/tenants/models.py, docs/DATA_MODEL.md §3, docs/SECURITY.md §4, and docs/OPEN_QUESTIONS.md.
+- **Changes:**
+  - `backend/config/settings/base.py`: Registered `apps.whatsapp` in `INSTALLED_APPS`.
+  - `backend/apps/whatsapp/__init__.py`: Package init.
+  - `backend/apps/whatsapp/apps.py`: WhatsappConfig AppConfig (`name = "apps.whatsapp"`, `label = "whatsapp"`).
+  - `backend/apps/whatsapp/models.py`: Created `WhatsAppAccount` (UUID PK, organization FK, provider_key, optional provider_account_reference, phone_number_id, restricted display fields display_phone_number and display_name, credential_mode choices, opaque credential_secret_ref, status choices, verification timestamps, created_by FK, standard timestamps, organization immutability on edit, non-unique composite lookup index on `[provider_key, phone_number_id]`), and `BranchWhatsAppAssignment` (UUID PK, organization FK, branch FK, whatsapp_account FK, status choices [active, inactive], assigned_by FK, assigned_at, ended_at, partial database unique constraint enforcing at most one active sender per branch across SQLite and PostgreSQL, cross-tenant consistency validation ensuring branch and account belong to assignment organization).
+  - `backend/apps/whatsapp/admin.py`: Registered `WhatsAppAccountAdmin` and `BranchWhatsAppAssignmentAdmin`, strictly excluding `credential_secret_ref` from `list_display`, protecting credentials from ordinary listings, and setting `organization` read-only on edit.
+  - `backend/apps/whatsapp/migrations/0001_initial.py`: Migration generated and applied cleanly against development SQLite database.
+  - `backend/tests/test_whatsapp_models.py`: 18 unit tests covering model creation, UUID PKs, choices, secret ref protection, organization immutability, non-unique phone ID indexing across accounts, cross-tenant assignment validation rejection, single-active-assignment database constraint enforcement, multiple inactive assignments preservation, and admin security.
+- **Why:** Establish WhatsApp sender identity and routing assignments per DATA_MODEL.md §3 without storing raw access tokens or allowing cross-tenant sender assignments.
+- **Commands run:**
+  - `& "...\backend\.venv\Scripts\python.exe" manage.py check --settings=config.settings.development` — System check identified no issues (0 silenced).
+  - `& "...\backend\.venv\Scripts\python.exe" manage.py makemigrations whatsapp --settings=config.settings.development` — Created `apps/whatsapp/migrations/0001_initial.py`.
+  - `& "...\backend\.venv\Scripts\python.exe" manage.py migrate --settings=config.settings.development` — Applied `whatsapp.0001_initial` OK.
+  - `& "...\backend\.venv\Scripts\python.exe" manage.py makemigrations --check --settings=config.settings.development` — No changes detected.
+  - `& "...\backend\.venv\Scripts\python.exe" manage.py test tests --settings=config.settings.development --verbosity=2` — Ran 117 tests in 49.846s — OK.
+- **Tests/checks:** 117 tests run (14 user + 25 config + 35 tenant + 25 device + 18 whatsapp), 0 failures, 0 errors. System check 0 issues. `makemigrations --check` clean.
+- **Security/reliability checks:** `credential_secret_ref` is treated as an opaque reference; raw access tokens are never stored; `credential_secret_ref` excluded from admin list displays; cross-organization assignments (`branch.organization != account.organization != assignment.organization`) rejected with `ValidationError`; single active assignment per branch enforced at database level with `UniqueConstraint(fields=["branch"], condition=Q(status="active"))`; historical assignments preserved; account organization immutable after initial save.
+- **Decisions:** Upstream provider uniqueness for `phone_number_id` remains unresolved per OQ-003/OQ-004, so a non-unique composite index `(provider_key, phone_number_id)` is used rather than speculative unique constraints; `credential_mode` supports `platform_managed`, `backend_secret`, and `pending_contract`; `status` supports `pending_verification`, `verified`, `disabled`, and `error`.
+- **Open issues/blockers:** None for Task 2C. Upstream WhatsApp provider contracts (OQ-001 through OQ-010) remain deferred to Phase 3+.
+- **Next step:** Phase 1 Task 2C complete. Awaiting approval for Phase 1 Task 2D (Report / Outbox models).
