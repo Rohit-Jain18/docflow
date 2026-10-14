@@ -80,7 +80,7 @@ The code is checked against a hash, expiry, attempt limit and intended device/br
 {"device":{"id":"uuid","name":"Main lab PC","status":"active","branch_id":"uuid"},"access_token":"short-lived-device-token","access_token_expires_at":"2026-10-12T10:00:00Z","refresh_token":"rotating-secret-returned-once","refresh_token_expires_at":"2026-11-11T10:00:00Z","configuration_version":1}
 ```
 
-Exact expiry policy must be selected and documented. Agent stores refresh secret only in Windows Credential Manager/DPAPI. If secure storage fails, activation fails closed.
+Token lifetime policy: Device access token lifetime is 10 minutes. Device refresh token lifetime is 30 days, rotating on every successful refresh. Agent stores refresh secret only in Windows Credential Manager/DPAPI. If secure storage fails, activation fails closed.
 - Errors: `400`, `410`, `429`.
 
 ### `POST /api/v1/agent/auth/refresh` — Agent

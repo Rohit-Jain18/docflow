@@ -111,6 +111,16 @@ class Device(models.Model):
     def __str__(self) -> str:
         return f"{self.name} ({self.get_status_display()})"
 
+    @property
+    def is_authenticated(self) -> bool:
+        """Allow Device to act as an authenticated principal in DRF requests."""
+        return True
+
+    @property
+    def is_anonymous(self) -> bool:
+        """Device is never an anonymous principal."""
+        return False
+
     def clean(self) -> None:
         """Validate tenant consistency and immutability."""
         super().clean()

@@ -342,3 +342,26 @@
 - **Open issues/blockers:** None for Task 2E. Provider callback signatures, webhook endpoints, and external event schemas remain unconfirmed per OQ-005.
 - **Next step:** Phase 1 Task 2E complete. Awaiting approval to proceed to next task.
 
+## 2026-10-14T22:48:00+05:30 — Phase 1 Task 3A: Device Activation and Credential Services
+
+- **Phase / task:** Phase 1 / Task 3A — Device Activation and Credential Services.
+- **Goal:** Implement the service layer on top of device models in `backend/apps/devices/services.py` and DRF Bearer authentication in `backend/apps/devices/authentication.py` per API_CONTRACTS.md §3, SECURITY.md §3, and DATA_MODEL.md §2.
+- **Inspection:** Inspected Git status, revision alignment, CLAUDE.md, existing device and audit models, docs/API_CONTRACTS.md §3, docs/SECURITY.md §3, and docs/DATA_MODEL.md §2.
+- **Changes:**
+  - `docs/API_CONTRACTS.md`: Documented token lifetime policy: 10 minutes for short-lived device access token, 30 days for rotating refresh token.
+  - `backend/apps/devices/models.py`: Added `is_authenticated` and `is_anonymous` properties to `Device` model for DRF principal compatibility.
+  - `backend/apps/devices/services.py`: Implemented `issue_activation_code` (cryptographically random 32-char code, SHA-256 hash stored in `code_hash`, raw code returned once, revocation of previous unconsumed codes, audit event emitted without raw code), `exchange_activation_code` (atomic code consumption inside `select_for_update` transaction, enforces attempt limits, expiry, revocation, single-use, device eligibility, updates device metadata, issues 30-day rotating refresh credential and 10-minute signed access token via `TimestampSigner`, emits audit event with zero secret leakage), `rotate_refresh_token` (atomic rotation, token reuse detection immediately revoking all outstanding device credentials and logging `TAMPERING_DETECTED`, issues fresh access token and replacement refresh credential), `generate_access_token`, and `verify_access_token`.
+  - `backend/apps/devices/authentication.py`: Implemented DRF `DeviceBearerAuthentication` class validating signed Bearer access tokens, verifying active device status, and enforcing tenant consistency.
+  - `backend/tests/test_device_services.py`: 26 comprehensive unit and integration tests covering code issuance, hashed-only storage, replacement revocation, expiry, revocation, single-use, attempt limits, eligibility checks, token signing, tampering detection, refresh rotation, token reuse detection and revocation, audit event safety, transaction rollback, and DRF Bearer authentication.
+- **Why:** Establish device onboarding, one-time activation exchange, session authentication, and rotating refresh credential lifecycles without storing plaintext secrets or exposing raw codes.
+- **Commands run:**
+  - `.\.venv\Scripts\python.exe manage.py check --settings=config.settings.development` — System check identified no issues (0 silenced).
+  - `.\.venv\Scripts\python.exe manage.py makemigrations --check --settings=config.settings.development` — No changes detected.
+  - `.\.venv\Scripts\python.exe manage.py test tests --settings=config.settings.development` — Ran 229 tests in 108.861s — OK.
+- **Tests/checks:** 229 tests run (14 user + 25 config + 35 tenant + 25 device model + 24 whatsapp + 45 reports + 35 audit + 26 device services), 0 failures, 0 errors. System check 0 issues. `makemigrations --check` clean.
+- **Security/reliability checks:** Raw activation codes and refresh tokens are never persisted in plaintext or logged in audit events; access tokens use cryptographic HMAC signatures with 10-minute expiry; refresh credentials rotate atomically on every use; token reuse detection immediately revokes all active device credentials; failed attempts persist incremented counters.
+- **Decisions:** Access tokens use Django's native `TimestampSigner` (no external JWT dependency required); `Device` exposes `is_authenticated=True` for DRF permission compatibility; attempt counters on failed code exchanges are persisted and audited.
+- **Open issues/blockers:** None for Task 3A. Production device registration HTTP endpoints deferred to upcoming task.
+- **Next step:** Phase 1 Task 3A complete. Awaiting approval to proceed to next task.
+
+
