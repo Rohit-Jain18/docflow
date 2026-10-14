@@ -5,8 +5,9 @@ Enforces:
   - Default rejection of untrusted client-supplied X-Forwarded-For headers.
   - Safe fallback to actual REMOTE_ADDR when directly reachable.
   - Forwarded IP resolution ONLY via explicit, approved trusted-proxy configuration:
-      * DOCFLOW_TRUSTED_PROXIES: Iterable of trusted reverse proxy IP addresses.
-      * DOCFLOW_NUM_PROXIES / REST_FRAMEWORK["NUM_PROXIES"]: Number of trusted proxies.
+      * DOCFLOW_TRUSTED_PROXIES: Iterable of trusted reverse proxy IP addresses or CIDR blocks.
+  - A non-zero DOCFLOW_NUM_PROXIES or NUM_PROXIES alone NEVER authorizes forwarded headers.
+  - Strict right-to-left traversal of proxy chains to extract the originating client IP.
   - Strict validation of IPv4/IPv6 address syntax.
   - Unified resolution for both DRF rate throttling and device telemetry.
 """
@@ -15,6 +16,7 @@ import ipaddress
 from typing import Optional, Set
 
 from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
 
 
 def is_valid_ip(ip_str: Optional[str]) -> bool:
@@ -26,6 +28,29 @@ def is_valid_ip(ip_str: Optional[str]) -> bool:
         return True
     except (ValueError, TypeError):
         return False
+
+
+def validate_trusted_proxy_entry(entry: str) -> None:
+    """
+    Validate that an entry is a syntactically valid IPv4/IPv6 address or CIDR network.
+    Raises ImproperlyConfigured on malformed entries or open wildcard networks (0.0.0.0/0).
+    """
+    clean = str(entry).strip()
+    if not clean:
+        raise ImproperlyConfigured("[Docflow] DOCFLOW_TRUSTED_PROXIES contains empty entry.")
+    try:
+        if "/" in clean:
+            net = ipaddress.ip_network(clean, strict=False)
+            if net.prefixlen == 0:
+                raise ImproperlyConfigured(
+                    f"[Docflow] Insecure trusted proxy wildcard range '{clean}' in DOCFLOW_TRUSTED_PROXIES is forbidden."
+                )
+        else:
+            ipaddress.ip_address(clean)
+    except ValueError as exc:
+        raise ImproperlyConfigured(
+            f"[Docflow] Invalid trusted proxy address or CIDR in DOCFLOW_TRUSTED_PROXIES: '{clean}'."
+        ) from exc
 
 
 def get_trusted_proxy_ips() -> Set[str]:
@@ -73,13 +98,13 @@ def get_client_ip(request) -> Optional[str]:
     Policy:
       1. Default (no trusted proxies configured):
          Always return REMOTE_ADDR. Any X-Forwarded-For header is ignored.
-      2. Explicit trusted proxies (DOCFLOW_TRUSTED_PROXIES):
-         Only if REMOTE_ADDR is in DOCFLOW_TRUSTED_PROXIES, parse X-Forwarded-For.
+      2. Non-zero proxy count alone:
+         A non-zero DOCFLOW_NUM_PROXIES or NUM_PROXIES alone never authorizes
+         forwarded headers. Fails closed to REMOTE_ADDR.
+      3. Explicit trusted proxies (DOCFLOW_TRUSTED_PROXIES):
+         Only if REMOTE_ADDR matches an entry in DOCFLOW_TRUSTED_PROXIES, parse X-Forwarded-For.
          Traverse the proxy chain from right to left, skipping trusted proxies,
          to extract the originating client IP.
-      3. Fixed proxy count (DOCFLOW_NUM_PROXIES / REST_FRAMEWORK["NUM_PROXIES"]):
-         If num_proxies > 0 and no explicit list is configured, take the IP at
-         index -num_proxies from X-Forwarded-For.
       4. Fallback:
          If forwarded IP is invalid, absent, or REMOTE_ADDR is untrusted,
          return REMOTE_ADDR if valid, else None.
@@ -95,13 +120,13 @@ def get_client_ip(request) -> Optional[str]:
 
     trusted_proxies = get_trusted_proxy_ips()
 
-    rf_settings = getattr(settings, "REST_FRAMEWORK", {})
-    num_proxies = getattr(settings, "DOCFLOW_NUM_PROXIES", None)
-    if num_proxies is None:
-        num_proxies = rf_settings.get("NUM_PROXIES", 0)
+    # If no trusted proxies are explicitly configured, always return REMOTE_ADDR.
+    # A non-zero DOCFLOW_NUM_PROXIES alone must never authorize forwarded headers.
+    if not trusted_proxies:
+        return remote_addr
 
-    # If no trusted proxy setup is active, use actual REMOTE_ADDR
-    if not trusted_proxies and (num_proxies is None or num_proxies <= 0):
+    # If REMOTE_ADDR does not match an explicitly trusted proxy, ignore XFF
+    if not remote_addr or not is_trusted_proxy(remote_addr, trusted_proxies):
         return remote_addr
 
     xff = request.META.get("HTTP_X_FORWARDED_FOR")
@@ -112,23 +137,10 @@ def get_client_ip(request) -> Optional[str]:
     if not addrs:
         return remote_addr
 
-    # If an explicit trusted proxy list is configured
-    if trusted_proxies:
-        # REMOTE_ADDR must be a trusted proxy; otherwise XFF is untrusted
-        if not remote_addr or not is_trusted_proxy(remote_addr, trusted_proxies):
-            return remote_addr
-
-        # Walk backwards from the rightmost proxy, skipping trusted proxies
-        for ip in reversed(addrs):
-            if not is_trusted_proxy(ip, trusted_proxies) and is_valid_ip(ip):
-                return ip
-        return remote_addr
-
-    # If fixed num_proxies is configured
-    if num_proxies and num_proxies > 0:
-        index = -min(num_proxies, len(addrs))
-        candidate = addrs[index]
-        if is_valid_ip(candidate):
-            return candidate
+    # Walk backwards from the rightmost proxy, skipping trusted proxies
+    for ip in reversed(addrs):
+        if not is_trusted_proxy(ip, trusted_proxies) and is_valid_ip(ip):
+            return ip
 
     return remote_addr
+

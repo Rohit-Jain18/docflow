@@ -128,7 +128,8 @@ REST_FRAMEWORK = {
 # client IP strictly from the actual REMOTE_ADDR.
 # To support trusted reverse proxies, configure an explicit list of trusted
 # proxy IPs via DOCFLOW_TRUSTED_PROXIES (tuple/list of IP strings or CIDR).
-# When empty or 0, forwarded headers are completely ignored.
+# When empty, forwarded headers are completely ignored.
+# A non-zero DOCFLOW_NUM_PROXIES alone never authorizes forwarded headers.
 NUM_PROXIES = 0
 DOCFLOW_NUM_PROXIES = 0
 DOCFLOW_TRUSTED_PROXIES = ()

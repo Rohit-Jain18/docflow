@@ -238,6 +238,60 @@ class ProductionSettingsValidationTest(unittest.TestCase):
         with self.assertRaises(ImproperlyConfigured):
             self._load(DATABASE_URL="mysql://user:pass@db:3306/docflow")
 
+    # ------------------------------------------------------------------
+    # Reverse Proxy Trust Configuration
+    # ------------------------------------------------------------------
+
+    def test_malformed_trusted_proxy_ip_raises(self):
+        from django.core.exceptions import ImproperlyConfigured
+        with self.assertRaises(ImproperlyConfigured):
+            self._load(DOCFLOW_TRUSTED_PROXIES="invalid_ip")
+
+    def test_malformed_trusted_proxy_cidr_raises(self):
+        from django.core.exceptions import ImproperlyConfigured
+        with self.assertRaises(ImproperlyConfigured):
+            self._load(DOCFLOW_TRUSTED_PROXIES="10.0.0.0/99")
+
+    def test_wildcard_trusted_proxy_range_raises(self):
+        from django.core.exceptions import ImproperlyConfigured
+        with self.assertRaises(ImproperlyConfigured):
+            self._load(DOCFLOW_TRUSTED_PROXIES="0.0.0.0/0")
+
+    def test_ipv6_wildcard_trusted_proxy_range_raises(self):
+        from django.core.exceptions import ImproperlyConfigured
+        with self.assertRaises(ImproperlyConfigured):
+            self._load(DOCFLOW_TRUSTED_PROXIES="::/0")
+
+    def test_proxy_count_without_trusted_proxies_raises(self):
+        from django.core.exceptions import ImproperlyConfigured
+        with self.assertRaises(ImproperlyConfigured):
+            self._load(DOCFLOW_NUM_PROXIES="1")
+
+    def test_invalid_proxy_count_raises(self):
+        from django.core.exceptions import ImproperlyConfigured
+        with self.assertRaises(ImproperlyConfigured):
+            self._load(DOCFLOW_NUM_PROXIES="not-a-number")
+
+    def test_negative_proxy_count_raises(self):
+        from django.core.exceptions import ImproperlyConfigured
+        with self.assertRaises(ImproperlyConfigured):
+            self._load(DOCFLOW_NUM_PROXIES="-1")
+
+    def test_valid_trusted_proxies_succeeds(self):
+        from django.core.exceptions import ImproperlyConfigured
+        try:
+            self._load(DOCFLOW_TRUSTED_PROXIES="10.0.0.1, 192.168.1.0/24")
+        except ImproperlyConfigured as exc:
+            self.fail(f"Valid trusted proxies raised: {exc}")
+
+    def test_valid_trusted_proxies_with_count_succeeds(self):
+        from django.core.exceptions import ImproperlyConfigured
+        try:
+            self._load(DOCFLOW_TRUSTED_PROXIES="10.0.0.1", DOCFLOW_NUM_PROXIES="1")
+        except ImproperlyConfigured as exc:
+            self.fail(f"Valid trusted proxies with count raised: {exc}")
+
+
 
 def _import_development_settings(env_overrides: dict) -> None:
     """Re-import development settings with patched environment."""

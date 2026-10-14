@@ -44,8 +44,13 @@ from apps.devices.services import (
     issue_activation_code,
     verify_access_token,
 )
+from django.core.exceptions import ImproperlyConfigured
 from apps.tenants.models import Branch, Lab, Organization
-from apps.devices.ip_utils import get_client_ip, is_valid_ip
+from apps.devices.ip_utils import (
+    get_client_ip,
+    is_valid_ip,
+    validate_trusted_proxy_entry,
+)
 from apps.devices.throttling import ActivationRateThrottle, RefreshRateThrottle
 
 
@@ -810,15 +815,98 @@ class ClientIPResolutionAndThrottlingSecurityTests(DeviceAPIBaseTestCase):
         self.assertEqual(resolved, "203.0.113.88")
 
     @override_settings(DOCFLOW_TRUSTED_PROXIES=(), DOCFLOW_NUM_PROXIES=1)
-    def test_configured_num_proxies_resolves_appropriate_hop(self):
+    def test_nonzero_proxy_count_without_trusted_proxies_fails_closed(self):
         class MockRequest:
             META = {
-                "REMOTE_ADDR": "127.0.0.1",
+                "REMOTE_ADDR": "198.51.100.10",
                 "HTTP_X_FORWARDED_FOR": "1.1.1.1, 203.0.113.77",
             }
 
+        # Non-zero proxy count alone must NEVER authorize forwarded headers
         resolved = get_client_ip(MockRequest())
-        self.assertEqual(resolved, "203.0.113.77")
+        self.assertEqual(resolved, "198.51.100.10")
+
+    @override_settings(
+        REST_FRAMEWORK={
+            "DEFAULT_AUTHENTICATION_CLASSES": [],
+            "DEFAULT_PERMISSION_CLASSES": [],
+            "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
+            "DEFAULT_PARSER_CLASSES": ["rest_framework.parsers.JSONParser"],
+            "EXCEPTION_HANDLER": "apps.devices.exceptions.api_exception_handler",
+            "DEFAULT_THROTTLE_RATES": {"agent_activation": "2/minute", "agent_refresh": "30/minute"},
+            "NUM_PROXIES": 1,
+        },
+        DOCFLOW_TRUSTED_PROXIES=(),
+        DOCFLOW_NUM_PROXIES=1,
+    )
+    def test_nonzero_proxy_count_cannot_bypass_throttling_for_direct_client(self):
+        # 1st request with spoofed XFF
+        r1 = self.client.post(
+            "/api/v1/agent/activation/exchange",
+            {"activation_code": "code1", "installation_id": "inst1"},
+            format="json",
+            REMOTE_ADDR="203.0.113.50",
+            HTTP_X_FORWARDED_FOR="1.1.1.1",
+        )
+        self.assertEqual(r1.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # 2nd request with different spoofed XFF
+        r2 = self.client.post(
+            "/api/v1/agent/activation/exchange",
+            {"activation_code": "code2", "installation_id": "inst2"},
+            format="json",
+            REMOTE_ADDR="203.0.113.50",
+            HTTP_X_FORWARDED_FOR="2.2.2.2",
+        )
+        self.assertEqual(r2.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # 3rd request from same REMOTE_ADDR must be throttled (429) despite proxy count > 0
+        r3 = self.client.post(
+            "/api/v1/agent/activation/exchange",
+            {"activation_code": "code3", "installation_id": "inst3"},
+            format="json",
+            REMOTE_ADDR="203.0.113.50",
+            HTTP_X_FORWARDED_FOR="3.3.3.3",
+        )
+        self.assertEqual(r3.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+        self.assertEqual(r3.data["code"], "rate_limited")
+
+    @override_settings(DOCFLOW_TRUSTED_PROXIES=("10.0.0.1",), DOCFLOW_NUM_PROXIES=1)
+    def test_explicitly_allowlisted_proxy_resolves_legitimate_client_address_correctly(self):
+        # Request arriving from explicitly allowlisted proxy 10.0.0.1
+        class MockRequest:
+            META = {
+                "REMOTE_ADDR": "10.0.0.1",
+                "HTTP_X_FORWARDED_FOR": "203.0.113.45",
+            }
+
+        resolved = get_client_ip(MockRequest())
+        self.assertEqual(resolved, "203.0.113.45")
+
+    def test_validate_trusted_proxy_entry_helper(self):
+        # Valid entries do not raise
+        validate_trusted_proxy_entry("10.0.0.1")
+        validate_trusted_proxy_entry("192.168.1.0/24")
+        validate_trusted_proxy_entry("2001:db8::1")
+        validate_trusted_proxy_entry("2001:db8::/32")
+
+        # Invalid entries raise ImproperlyConfigured
+        with self.assertRaises(ImproperlyConfigured):
+            validate_trusted_proxy_entry("")
+
+        with self.assertRaises(ImproperlyConfigured):
+            validate_trusted_proxy_entry("not-an-ip")
+
+        with self.assertRaises(ImproperlyConfigured):
+            validate_trusted_proxy_entry("10.0.0.0/99")
+
+        # Wildcards raise ImproperlyConfigured
+        with self.assertRaises(ImproperlyConfigured):
+            validate_trusted_proxy_entry("0.0.0.0/0")
+
+        with self.assertRaises(ImproperlyConfigured):
+            validate_trusted_proxy_entry("::/0")
+
 
     def test_invalid_and_malformed_ips_sanitized_to_remote_addr(self):
         self.assertFalse(is_valid_ip(None))

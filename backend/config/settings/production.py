@@ -6,6 +6,7 @@ configuration is absent or unsafe.  Never falls back to SQLite.
 Never logs secret values.
 """
 
+import ipaddress
 import os
 import dj_database_url
 from django.core.exceptions import ImproperlyConfigured
@@ -142,13 +143,45 @@ STATIC_ROOT = BASE_DIR / "staticfiles"  # noqa: F405
 # ---------------------------------------------------------------------------
 _trusted_proxies_raw = os.environ.get("DOCFLOW_TRUSTED_PROXIES", "")
 if _trusted_proxies_raw:
-    DOCFLOW_TRUSTED_PROXIES = tuple(
-        p.strip() for p in _trusted_proxies_raw.split(",") if p.strip()
-    )
+    _entries = [p.strip() for p in _trusted_proxies_raw.split(",") if p.strip()]
+    if not _entries:
+        raise ImproperlyConfigured(
+            "[Docflow] DOCFLOW_TRUSTED_PROXIES was provided but contains no valid IP addresses or CIDR entries."
+        )
+    for _entry in _entries:
+        try:
+            if "/" in _entry:
+                _net = ipaddress.ip_network(_entry, strict=False)
+                if _net.prefixlen == 0:
+                    raise ImproperlyConfigured(
+                        f"[Docflow] Insecure trusted proxy wildcard range '{_entry}' in DOCFLOW_TRUSTED_PROXIES is forbidden."
+                    )
+            else:
+                ipaddress.ip_address(_entry)
+        except ValueError as _exc:
+            raise ImproperlyConfigured(
+                f"[Docflow] Invalid trusted proxy address or CIDR in DOCFLOW_TRUSTED_PROXIES: '{_entry}'."
+            ) from _exc
+    DOCFLOW_TRUSTED_PROXIES = tuple(_entries)
 
 _num_proxies_raw = os.environ.get("DOCFLOW_NUM_PROXIES", "")
-if _num_proxies_raw.isdigit():
-    DOCFLOW_NUM_PROXIES = int(_num_proxies_raw)
-    NUM_PROXIES = DOCFLOW_NUM_PROXIES
-    REST_FRAMEWORK["NUM_PROXIES"] = DOCFLOW_NUM_PROXIES
+if _num_proxies_raw:
+    try:
+        _num = int(_num_proxies_raw)
+        if _num < 0:
+            raise ValueError
+    except ValueError:
+        raise ImproperlyConfigured(
+            f"[Docflow] DOCFLOW_NUM_PROXIES must be a non-negative integer, got '{_num_proxies_raw}'."
+        )
+
+    # Fail closed on conflicting configuration: proxy count alone cannot authorize forwarded headers
+    if _num > 0 and not DOCFLOW_TRUSTED_PROXIES:
+        raise ImproperlyConfigured(
+            "[Docflow] DOCFLOW_NUM_PROXIES > 0 is configured without DOCFLOW_TRUSTED_PROXIES. "
+            "A proxy count alone cannot authorize forwarded headers. Explicitly configure trusted proxy IPs/CIDRs."
+        )
+    DOCFLOW_NUM_PROXIES = _num
+    NUM_PROXIES = _num
+    REST_FRAMEWORK["NUM_PROXIES"] = _num
 
