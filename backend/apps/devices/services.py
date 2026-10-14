@@ -313,6 +313,8 @@ def exchange_activation_code(
     now = tz_utils.now()
 
     failure_error = None
+    result = None
+
     with transaction.atomic():
         code = (
             DeviceActivationCode.objects.select_for_update()
@@ -413,6 +415,7 @@ def exchange_activation_code(
             )
             failure_error = ActivationCodeExpiredError("Activation code has expired.")
         else:
+            # Code is valid and unconsumed. Acquire lock on associated device to verify eligibility
             device = Device.objects.select_for_update().get(id=code.device_id)
             if device.status in (DeviceStatus.REVOKED, DeviceStatus.DISABLED):
                 code.attempt_count += 1
@@ -435,89 +438,87 @@ def exchange_activation_code(
                 failure_error = IneligibleDeviceError(
                     f"Device '{device.name}' cannot be activated in status '{device.status}'."
                 )
+            else:
+                # All locks held, all state verified under lock. Execute success mutations atomically:
+                # 1. Consume code atomically
+                code.consumed_at = now
+                code.attempt_count += 1
+                code.save(update_fields=["consumed_at", "attempt_count"])
+
+                # 2. Activate device and record metadata
+                device.status = DeviceStatus.ACTIVE
+                device.activated_at = now
+                device.last_seen_at = now
+                if agent_version:
+                    device.agent_version = agent_version
+                if platform:
+                    device.platform = platform
+                if ip_address:
+                    device.last_ip = ip_address
+                device.save(
+                    update_fields=[
+                        "status",
+                        "activated_at",
+                        "last_seen_at",
+                        "agent_version",
+                        "platform",
+                        "last_ip",
+                        "updated_at",
+                    ]
+                )
+
+                # 3. Clean up any existing active refresh credentials for this device
+                DeviceRefreshCredential.objects.filter(
+                    device=device,
+                    revoked_at__isnull=True,
+                ).update(revoked_at=now)
+
+                # 4. Create initial refresh credential
+                raw_refresh_token = generate_refresh_secret()
+                refresh_hash = hash_token(raw_refresh_token)
+                refresh_expires_at = now + DEVICE_REFRESH_TOKEN_LIFETIME
+
+                DeviceRefreshCredential.objects.create(
+                    device=device,
+                    credential_hash=refresh_hash,
+                    issued_at=now,
+                    expires_at=refresh_expires_at,
+                )
+
+                # 5. Generate short-lived signed access token
+                access_token, access_token_expires_at = generate_access_token(device)
+
+                # 6. Audit successful activation
+                AuditEvent.objects.create(
+                    organization=device.organization,
+                    actor_device=device,
+                    action=AuditAction.DEVICE_ACTIVATED,
+                    target_type="device",
+                    target_id=str(device.id),
+                    request_id=request_id,
+                    safe_metadata={
+                        "device_name": device.name,
+                        "device_id": str(device.id),
+                        "branch_id": str(device.branch_id),
+                        "agent_version": device.agent_version or "unknown",
+                        "platform": device.platform,
+                        "status": "active",
+                    },
+                )
+
+                result = ActivationResult(
+                    device=device,
+                    access_token=access_token,
+                    access_token_expires_at=access_token_expires_at,
+                    refresh_token=raw_refresh_token,
+                    refresh_token_expires_at=refresh_expires_at,
+                    configuration_version=1,
+                )
 
     if failure_error:
         raise failure_error
 
-    # Atomic activation execution
-    with transaction.atomic():
-        code = DeviceActivationCode.objects.select_for_update().get(id=code.id)
-        device = Device.objects.select_for_update().get(id=code.device_id)
-
-        # 6. Consume code atomically
-        code.consumed_at = now
-        code.attempt_count += 1
-        code.save(update_fields=["consumed_at", "attempt_count"])
-
-        # 7. Activate device and record metadata
-        device.status = DeviceStatus.ACTIVE
-        device.activated_at = now
-        device.last_seen_at = now
-        if agent_version:
-            device.agent_version = agent_version
-        if platform:
-            device.platform = platform
-        if ip_address:
-            device.last_ip = ip_address
-        device.save(
-            update_fields=[
-                "status",
-                "activated_at",
-                "last_seen_at",
-                "agent_version",
-                "platform",
-                "last_ip",
-                "updated_at",
-            ]
-        )
-
-        # 8. Clean up any existing active refresh credentials for this device
-        DeviceRefreshCredential.objects.filter(
-            device=device,
-            revoked_at__isnull=True,
-        ).update(revoked_at=now)
-
-        # 9. Create initial refresh credential
-        raw_refresh_token = generate_refresh_secret()
-        refresh_hash = hash_token(raw_refresh_token)
-        refresh_expires_at = now + DEVICE_REFRESH_TOKEN_LIFETIME
-
-        DeviceRefreshCredential.objects.create(
-            device=device,
-            credential_hash=refresh_hash,
-            issued_at=now,
-            expires_at=refresh_expires_at,
-        )
-
-        # 10. Generate short-lived signed access token
-        access_token, access_token_expires_at = generate_access_token(device)
-
-        # 11. Audit successful activation
-        AuditEvent.objects.create(
-            organization=device.organization,
-            actor_device=device,
-            action=AuditAction.DEVICE_ACTIVATED,
-            target_type="device",
-            target_id=str(device.id),
-            request_id=request_id,
-            safe_metadata={
-                "device_name": device.name,
-                "device_id": str(device.id),
-                "branch_id": str(device.branch_id),
-                "agent_version": device.agent_version or "unknown",
-                "platform": device.platform,
-                "status": "active",
-            },
-        )
-
-    return ActivationResult(
-        device=device,
-        access_token=access_token,
-        access_token_expires_at=access_token_expires_at,
-        refresh_token=raw_refresh_token,
-        refresh_token_expires_at=refresh_expires_at,
-        configuration_version=1,
-    )
+    return result
 
 
 def rotate_refresh_token(
@@ -529,10 +530,12 @@ def rotate_refresh_token(
     Atomically rotate an unexpired, unrevoked refresh token.
 
     Enforces:
-      - Database-level locking inside transaction.atomic.
+      - Single transaction.atomic() for validation and rotation.
+      - Database-level locking (select_for_update) on the refresh credential and device.
       - Detection of rotated token reuse: immediately revokes all outstanding
         refresh credentials for the device and logs TAMPERING_DETECTED.
       - Rejection of unknown, expired, or revoked tokens.
+      - Rechecks state under lock: competing requests cannot independently rotate.
       - Creation of replacement credential linked via replaced_by.
       - Issuance of fresh signed access token.
       - Zero raw credential logging or metadata storage.
@@ -544,6 +547,8 @@ def rotate_refresh_token(
     now = tz_utils.now()
 
     failure_error = None
+    result = None
+
     with transaction.atomic():
         cred = (
             DeviceRefreshCredential.objects.select_for_update()
@@ -630,42 +635,39 @@ def rotate_refresh_token(
                 failure_error = InvalidRefreshTokenError(
                     f"Device '{device.name}' is in status '{device.status}' and cannot refresh credentials."
                 )
+            else:
+                new_raw_refresh = generate_refresh_secret()
+                new_hash = hash_token(new_raw_refresh)
+                new_expires_at = now + DEVICE_REFRESH_TOKEN_LIFETIME
+
+                new_cred = DeviceRefreshCredential.objects.create(
+                    device=device,
+                    credential_hash=new_hash,
+                    issued_at=now,
+                    expires_at=new_expires_at,
+                )
+
+                cred.rotated_at = now
+                cred.replaced_by = new_cred
+                cred.save(update_fields=["rotated_at", "replaced_by"])
+
+                # Update device telemetry
+                device.last_seen_at = now
+                if ip_address:
+                    device.last_ip = ip_address
+                device.save(update_fields=["last_seen_at", "last_ip", "updated_at"])
+
+                # Fresh signed access token
+                access_token, access_token_expires_at = generate_access_token(device)
+
+                result = RefreshResult(
+                    access_token=access_token,
+                    access_token_expires_at=access_token_expires_at,
+                    refresh_token=new_raw_refresh,
+                    refresh_token_expires_at=new_expires_at,
+                )
 
     if failure_error:
         raise failure_error
 
-    # Atomic rotation execution
-    with transaction.atomic():
-        cred = DeviceRefreshCredential.objects.select_for_update().get(id=cred.id)
-        device = Device.objects.select_for_update().get(id=cred.device_id)
-
-        new_raw_refresh = generate_refresh_secret()
-        new_hash = hash_token(new_raw_refresh)
-        new_expires_at = now + DEVICE_REFRESH_TOKEN_LIFETIME
-
-        new_cred = DeviceRefreshCredential.objects.create(
-            device=device,
-            credential_hash=new_hash,
-            issued_at=now,
-            expires_at=new_expires_at,
-        )
-
-        cred.rotated_at = now
-        cred.replaced_by = new_cred
-        cred.save(update_fields=["rotated_at", "replaced_by"])
-
-        # Update device telemetry
-        device.last_seen_at = now
-        if ip_address:
-            device.last_ip = ip_address
-        device.save(update_fields=["last_seen_at", "last_ip", "updated_at"])
-
-        # Fresh signed access token
-        access_token, access_token_expires_at = generate_access_token(device)
-
-    return RefreshResult(
-        access_token=access_token,
-        access_token_expires_at=access_token_expires_at,
-        refresh_token=new_raw_refresh,
-        refresh_token_expires_at=new_expires_at,
-    )
+    return result

@@ -12,12 +12,15 @@ Covers:
 """
 
 import datetime
+import threading
+import unittest
 import uuid
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
-from django.test import RequestFactory, TestCase
+from django.db import connection, connections
+from django.test import RequestFactory, TestCase, TransactionTestCase
 from django.utils import timezone as tz_utils
 from rest_framework.exceptions import AuthenticationFailed
 
@@ -497,3 +500,328 @@ class DeviceBearerAuthenticationTest(DeviceServiceBaseTestCase):
                 with self.assertRaises(AuthenticationFailed) as ctx:
                     self.auth.authenticate(request)
                 self.assertIn(status, str(ctx.exception))
+
+
+class DeviceServiceAtomicityAndConcurrencyTests(TransactionTestCase):
+    """
+    Concurrency and atomicity regression tests for device services.
+
+    Verifies:
+      - Failed activation attempts, revocations, and audit records survive the service error.
+      - Failed activation rolls back partial successful state changes (atomicity).
+      - Refresh token reuse triggers full credential revocation and tampering audit.
+      - Competing concurrent activation requests produce at most one successful redemption
+        and the loser sees the updated consumed state (guarded by database SELECT FOR UPDATE support).
+      - Competing concurrent refresh requests cannot independently create multiple replacements
+        from the same credential (guarded by database SELECT FOR UPDATE support).
+    """
+
+    def setUp(self):
+        self.org = Organization.objects.create(name="Concurrency Health", slug="concurrency-health")
+        self.lab = Lab.objects.create(organization=self.org, name="Concurrency Lab", code="CLAB")
+        self.branch = Branch.objects.create(organization=self.org, lab=self.lab, name="Main Clinic", code="MAIN")
+        self.device = Device.objects.create(
+            organization=self.org,
+            branch=self.branch,
+            name="Testing Terminal 01",
+            status=DeviceStatus.PENDING_ACTIVATION,
+        )
+
+    def test_failed_attempt_counts_and_audit_records_survive_service_error(self):
+        """
+        Verify that failed-attempt counters, revocations, and security audit records
+        are committed to the database and survive the raised service error.
+        """
+        # 1. Unknown activation code
+        with self.assertRaises(InvalidActivationCodeError):
+            exchange_activation_code(
+                activation_code="invalid-code-12345",
+                installation_id="inst-01",
+                request_id="req-unknown",
+            )
+        self.assertTrue(
+            AuditEvent.objects.filter(
+                action=AuditAction.PLATFORM_SECURITY_FAILURE,
+                request_id="req-unknown",
+            ).exists()
+        )
+
+        # 2. Revoked activation code
+        issued = issue_activation_code(self.device, request_id="req-issue-revoked")
+        issued.code_record.revoked_at = tz_utils.now()
+        issued.code_record.save(update_fields=["revoked_at"])
+
+        with self.assertRaises(ActivationCodeRevokedError):
+            exchange_activation_code(
+                activation_code=issued.raw_code,
+                installation_id="inst-01",
+                request_id="req-attempt-revoked",
+            )
+        issued.code_record.refresh_from_db()
+        self.assertEqual(issued.code_record.attempt_count, 1)
+        self.assertTrue(
+            AuditEvent.objects.filter(
+                action=AuditAction.SECURITY_FAILURE,
+                request_id="req-attempt-revoked",
+            ).exists()
+        )
+
+        # 3. Expired activation code
+        issued_exp = issue_activation_code(self.device, request_id="req-issue-exp")
+        issued_exp.code_record.expires_at = tz_utils.now() - datetime.timedelta(hours=1)
+        issued_exp.code_record.save(update_fields=["expires_at"])
+
+        with self.assertRaises(ActivationCodeExpiredError):
+            exchange_activation_code(
+                activation_code=issued_exp.raw_code,
+                installation_id="inst-01",
+                request_id="req-attempt-exp",
+            )
+        issued_exp.code_record.refresh_from_db()
+        self.assertEqual(issued_exp.code_record.attempt_count, 1)
+        self.assertTrue(
+            AuditEvent.objects.filter(
+                action=AuditAction.SECURITY_FAILURE,
+                request_id="req-attempt-exp",
+            ).exists()
+        )
+
+        # 4. Attempt limit exceeded
+        issued_lim = issue_activation_code(self.device, request_id="req-issue-lim")
+        issued_lim.code_record.attempt_count = MAX_ACTIVATION_ATTEMPTS
+        issued_lim.code_record.save(update_fields=["attempt_count"])
+
+        with self.assertRaises(ActivationAttemptLimitError):
+            exchange_activation_code(
+                activation_code=issued_lim.raw_code,
+                installation_id="inst-01",
+                request_id="req-attempt-lim",
+            )
+        issued_lim.code_record.refresh_from_db()
+        self.assertEqual(issued_lim.code_record.attempt_count, MAX_ACTIVATION_ATTEMPTS + 1)
+        self.assertIsNotNone(issued_lim.code_record.revoked_at)
+        self.assertTrue(
+            AuditEvent.objects.filter(
+                action=AuditAction.SECURITY_FAILURE,
+                request_id="req-attempt-lim",
+            ).exists()
+        )
+
+        # 5. Ineligible device
+        ineligible_dev = Device.objects.create(
+            organization=self.org,
+            branch=self.branch,
+            name="Revoked Terminal",
+            status=DeviceStatus.REVOKED,
+        )
+        raw_ineligible = "ineligible-code-12345678"
+        code_ineligible = DeviceActivationCode.objects.create(
+            organization=self.org,
+            branch=self.branch,
+            device=ineligible_dev,
+            code_hash=hash_token(raw_ineligible),
+        )
+
+        with self.assertRaises(IneligibleDeviceError):
+            exchange_activation_code(
+                activation_code=raw_ineligible,
+                installation_id="inst-01",
+                request_id="req-attempt-ineligible",
+            )
+        code_ineligible.refresh_from_db()
+        self.assertEqual(code_ineligible.attempt_count, 1)
+        self.assertTrue(
+            AuditEvent.objects.filter(
+                action=AuditAction.SECURITY_FAILURE,
+                request_id="req-attempt-ineligible",
+            ).exists()
+        )
+
+    def test_failed_activation_rolls_back_partial_successful_state(self):
+        """
+        Verify that an unhandled failure during activation atomically rolls back
+        code consumption, device activation, credential creation, and success audit events.
+        """
+        issued = issue_activation_code(self.device, request_id="req-atomic-test")
+
+        # Simulate unexpected failure during access token generation
+        with patch("apps.devices.services.generate_access_token", side_effect=RuntimeError("Token service crashed")):
+            with self.assertRaises(RuntimeError):
+                exchange_activation_code(
+                    activation_code=issued.raw_code,
+                    installation_id="inst-01",
+                    request_id="req-crash",
+                )
+
+        # Verify complete rollback:
+        issued.code_record.refresh_from_db()
+        self.assertIsNone(issued.code_record.consumed_at)
+        self.assertEqual(issued.code_record.attempt_count, 0)
+
+        self.device.refresh_from_db()
+        self.assertEqual(self.device.status, DeviceStatus.PENDING_ACTIVATION)
+        self.assertIsNone(self.device.activated_at)
+
+        # No credentials should exist
+        self.assertEqual(DeviceRefreshCredential.objects.filter(device=self.device).count(), 0)
+
+        # No success audit event should exist
+        self.assertFalse(
+            AuditEvent.objects.filter(
+                action=AuditAction.DEVICE_ACTIVATED,
+                target_id=str(self.device.id),
+            ).exists()
+        )
+
+    def test_refresh_token_reuse_revocation_and_audit_policy(self):
+        """
+        Verify that rotating an already-rotated refresh token detects reuse,
+        immediately revokes all active credentials for the device, and logs TAMPERING_DETECTED.
+        """
+        issued = issue_activation_code(self.device)
+        activation = exchange_activation_code(
+            activation_code=issued.raw_code,
+            installation_id="inst-01",
+            request_id="req-act",
+        )
+
+        # First legitimate rotation
+        refresh_1 = activation.refresh_token
+        rotation_result = rotate_refresh_token(
+            refresh_token=refresh_1,
+            request_id="req-rot-1",
+        )
+        refresh_2 = rotation_result.refresh_token
+
+        # Active replacement exists
+        cred_2 = DeviceRefreshCredential.objects.get(credential_hash=hash_token(refresh_2))
+        self.assertIsNone(cred_2.revoked_at)
+
+        # Second attempt using already-rotated refresh_1 (token reuse!)
+        with self.assertRaises(RefreshTokenReuseError):
+            rotate_refresh_token(
+                refresh_token=refresh_1,
+                request_id="req-reuse",
+            )
+
+        # cred_2 must now be revoked
+        cred_2.refresh_from_db()
+        self.assertIsNotNone(cred_2.revoked_at)
+
+        # TAMPERING_DETECTED audit event must be committed
+        tamper_event = AuditEvent.objects.filter(
+            action=AuditAction.TAMPERING_DETECTED,
+            target_id=str(self.device.id),
+            request_id="req-reuse",
+        ).first()
+        self.assertIsNotNone(tamper_event)
+        self.assertEqual(tamper_event.safe_metadata.get("error_code"), "refresh_token_reuse_detected")
+
+    @unittest.skipUnless(
+        connection.features.has_select_for_update,
+        "Database does not support SELECT FOR UPDATE row locking (e.g. SQLite in development); requires PostgreSQL for row-level concurrency.",
+    )
+    def test_concurrent_activation_competing_requests(self):
+        """
+        Verify that concurrent activation requests for the same code produce
+        at most one successful redemption, and the losing request sees the updated consumed state.
+        """
+        issued = issue_activation_code(self.device)
+        results = [None, None]
+        errors = [None, None]
+
+        def activate_worker(idx):
+            try:
+                connections.close_all()
+                results[idx] = exchange_activation_code(
+                    activation_code=issued.raw_code,
+                    installation_id=f"inst-conc-{idx}",
+                    request_id=f"req-conc-{idx}",
+                )
+            except Exception as e:
+                errors[idx] = e
+            finally:
+                connections.close_all()
+
+        threads = [
+            threading.Thread(target=activate_worker, args=(0,)),
+            threading.Thread(target=activate_worker, args=(1,)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        successes = [r for r in results if r is not None]
+        failures = [e for e in errors if e is not None]
+
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], ActivationCodeConsumedError)
+
+        self.assertEqual(
+            DeviceRefreshCredential.objects.filter(device=self.device, revoked_at__isnull=True).count(),
+            1,
+        )
+
+        issued.code_record.refresh_from_db()
+        self.assertIsNotNone(issued.code_record.consumed_at)
+        self.assertEqual(issued.code_record.attempt_count, 2)
+
+    @unittest.skipUnless(
+        connection.features.has_select_for_update,
+        "Database does not support SELECT FOR UPDATE row locking (e.g. SQLite in development); requires PostgreSQL for row-level concurrency.",
+    )
+    def test_concurrent_refresh_competing_requests(self):
+        """
+        Verify that concurrent refresh requests cannot independently create multiple
+        replacements from the same credential, and reuse is detected under lock.
+        """
+        issued = issue_activation_code(self.device)
+        activation = exchange_activation_code(
+            activation_code=issued.raw_code,
+            installation_id="inst-initial",
+        )
+        refresh_token = activation.refresh_token
+
+        results = [None, None]
+        errors = [None, None]
+
+        def refresh_worker(idx):
+            try:
+                connections.close_all()
+                results[idx] = rotate_refresh_token(
+                    refresh_token=refresh_token,
+                    request_id=f"req-rot-conc-{idx}",
+                )
+            except Exception as e:
+                errors[idx] = e
+            finally:
+                connections.close_all()
+
+        threads = [
+            threading.Thread(target=refresh_worker, args=(0,)),
+            threading.Thread(target=refresh_worker, args=(1,)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        successes = [r for r in results if r is not None]
+        failures = [e for e in errors if e is not None]
+
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], RefreshTokenReuseError)
+
+        self.assertEqual(
+            DeviceRefreshCredential.objects.filter(device=self.device, revoked_at__isnull=True).count(),
+            0,
+        )
+        self.assertTrue(
+            AuditEvent.objects.filter(
+                action=AuditAction.TAMPERING_DETECTED,
+                target_id=str(self.device.id),
+            ).exists()
+        )
