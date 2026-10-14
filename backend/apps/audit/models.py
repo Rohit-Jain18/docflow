@@ -349,7 +349,7 @@ class AuditEvent(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     organization = models.ForeignKey(
         Organization,
-        on_delete=models.CASCADE,
+        on_delete=models.PROTECT,
         null=True,
         blank=True,
         related_name="audit_events",
@@ -437,10 +437,7 @@ class AuditEvent(models.Model):
         errors = {}
 
         # 1. Organization requirement: Nullable only for explicit platform-level actions
-        is_platform_action = (
-            self.action in PLATFORM_AUDIT_ACTIONS
-            or (self.action and self.action.startswith("platform_"))
-        )
+        is_platform_action = self.action in PLATFORM_AUDIT_ACTIONS
         if self.organization_id is None and not is_platform_action:
             errors["organization"] = (
                 f"Organization is required for action '{self.action}'. "

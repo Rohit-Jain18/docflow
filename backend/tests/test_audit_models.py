@@ -18,6 +18,7 @@ from django.contrib.admin.sites import AdminSite
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError
+from django.db.models import ProtectedError
 from django.test import TestCase
 from django.utils import timezone as tz_utils
 
@@ -138,6 +139,25 @@ class AuditEventModelTest(TestCase):
                 event.full_clean()
                 event.save()
                 self.assertIsNone(event.organization)
+
+    def test_unknown_platform_action_without_organization_is_rejected(self):
+        unknown_platform_actions = [
+            "platform_custom_action",
+            "platform_unknown_override",
+            "platform_debug_mode",
+            "platform_arbitrary_event",
+        ]
+        for action in unknown_platform_actions:
+            with self.subTest(action=action):
+                event = AuditEvent(
+                    organization=None,
+                    action=action,
+                    target_type="system",
+                    target_id="sys-unknown",
+                )
+                with self.assertRaises(ValidationError) as ctx:
+                    event.full_clean()
+                self.assertIn("organization", ctx.exception.message_dict)
 
     # -----------------------------------------------------------------------
     # Actor-device tenant consistency
@@ -434,6 +454,17 @@ class AuditEventModelTest(TestCase):
         with self.assertRaises(ValidationError) as ctx:
             AuditEvent.objects.filter(id=event.id).delete()
         self.assertIn("cannot be deleted", str(ctx.exception).lower())
+
+    def test_organization_with_audit_events_cannot_be_deleted(self):
+        event = AuditEvent.objects.create(
+            organization=self.org_a,
+            action=AuditAction.ORGANIZATION_CREATED,
+            target_type="organization",
+            target_id=str(self.org_a.id),
+        )
+        with self.assertRaises(ProtectedError):
+            self.org_a.delete()
+        self.assertTrue(Organization.objects.filter(id=self.org_a.id).exists())
 
 
 class WebhookReceiptModelTest(TestCase):
