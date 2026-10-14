@@ -32,15 +32,61 @@ from apps.whatsapp.models import BranchWhatsAppAssignment
 
 HEX_64_REGEX = re.compile(r"^[0-9a-f]{64}$")
 E164_REGEX = re.compile(r"^\+[1-9]\d{6,14}$")
-FORBIDDEN_PAYLOAD_KEYS = {
-    "raw_payload",
+FORBIDDEN_KEY_PATTERNS = {
+    "rawpayload",
     "payload",
-    "access_token",
+    "accesstoken",
     "token",
     "secret",
     "authorization",
     "password",
+    "credential",
+    "apikey",
+    "privatekey",
+    "bearer",
+    "body",
 }
+
+ALLOWED_SAFE_SUMMARY_FIELDS = {
+    "wamid",
+    "status",
+    "error_code",
+    "error_message",
+    "timestamp",
+    "reason",
+    "description",
+    "event_id",
+    "recipient_id",
+}
+
+
+def normalize_key(key: str) -> str:
+    """Normalize a key string by removing non-alphanumeric characters and converting to lowercase."""
+    return re.sub(r"[^a-zA-Z0-9]", "", str(key)).lower()
+
+
+def check_forbidden_keys_recursive(data) -> None:
+    """
+    Recursively check nested dictionaries and lists for forbidden keys or normalized variants.
+    Raises ValidationError if any forbidden key pattern is detected.
+    """
+    if isinstance(data, dict):
+        for k, v in data.items():
+            norm_k = normalize_key(k)
+            for forbidden in FORBIDDEN_KEY_PATTERNS:
+                if forbidden in norm_k:
+                    raise ValidationError(
+                        {
+                            "safe_payload_summary": (
+                                f"Forbidden key '{k}' (or variant) is not permitted in safe_payload_summary."
+                            )
+                        }
+                    )
+            check_forbidden_keys_recursive(v)
+    elif isinstance(data, (list, tuple)):
+        for item in data:
+            check_forbidden_keys_recursive(item)
+
 
 
 class ReportStatus(models.TextChoices):
@@ -864,19 +910,33 @@ class DeliveryEvent(models.Model):
                     )
 
         # Payload security: ensure safe_payload_summary is a dict and free of raw payloads/secrets
-        if self.safe_payload_summary:
+        if self.safe_payload_summary is not None:
             if not isinstance(self.safe_payload_summary, dict):
                 errors["safe_payload_summary"] = "safe_payload_summary must be a dictionary."
             else:
-                for k in self.safe_payload_summary.keys():
-                    if str(k).lower() in FORBIDDEN_PAYLOAD_KEYS:
-                        errors["safe_payload_summary"] = (
-                            "Raw webhook payloads or secret credentials must not be stored in safe_payload_summary."
-                        )
-                        break
+                # 1. Recursive check for forbidden keys and normalized variants across nested dicts and lists
+                try:
+                    check_forbidden_keys_recursive(self.safe_payload_summary)
+                except ValidationError as e:
+                    errors.update(e.message_dict)
+
+                # 2. Allowlist and nested object validation (permit only documented safe summary fields; reject arbitrary nested objects)
+                if "safe_payload_summary" not in errors:
+                    for k, v in self.safe_payload_summary.items():
+                        if k not in ALLOWED_SAFE_SUMMARY_FIELDS:
+                            errors["safe_payload_summary"] = (
+                                f"Unrecognized field '{k}' is not permitted in safe_payload_summary."
+                            )
+                            break
+                        if isinstance(v, (dict, list, tuple, set)):
+                            errors["safe_payload_summary"] = (
+                                f"Arbitrary nested object in field '{k}' is not permitted in safe_payload_summary."
+                            )
+                            break
 
         if errors:
             raise ValidationError(errors)
+
 
     def save(self, *args, **kwargs) -> None:
         """Enforce validation on normal saves."""

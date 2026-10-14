@@ -484,13 +484,45 @@ class MediaReferenceModelTest(TestCase):
         self.assertEqual(ref.download_url, "https://tmpfiles.org/dl/12345/fictional.pdf")
         self.assertEqual(ref.expires_at, expiry)
 
-    def test_admin_excludes_sensitive_reference_fields(self):
+    def test_admin_excludes_sensitive_reference_fields_from_list_and_form(self):
         site = AdminSite()
         admin = MediaReferenceAdmin(MediaReference, site)
-        self.assertNotIn("encrypted_reference", admin.list_display)
-        self.assertNotIn("download_url", admin.list_display)
+        ref = MediaReference.objects.create(
+            report=self.report,
+            kind=MediaKind.PROVIDER_MEDIA_ID,
+            provider_media_id="wamid-media-123456",
+        )
+
+        sensitive_fields = ("encrypted_reference", "download_url", "provider_media_id")
+
+        # Excluded from list display
+        for field_name in sensitive_fields:
+            self.assertNotIn(field_name, admin.list_display)
+
+        # Excluded entirely from change form
+        change_form = admin.get_form(request=None, obj=ref)
+        for field_name in sensitive_fields:
+            self.assertNotIn(field_name, change_form.base_fields)
+
+        # Excluded entirely from create form
+        create_form = admin.get_form(request=None, obj=None)
+        for field_name in sensitive_fields:
+            self.assertNotIn(field_name, create_form.base_fields)
+
+        # Excluded from get_fields presentation
+        fields = admin.get_fields(request=None, obj=ref)
+        for field_name in sensitive_fields:
+            self.assertNotIn(field_name, fields)
+
+        # Safe operational metadata is preserved
+        self.assertIn("id", admin.list_display)
         self.assertIn("kind", admin.list_display)
         self.assertIn("expires_at", admin.list_display)
+        self.assertIn("created_at", admin.list_display)
+        self.assertIn("deleted_at", admin.list_display)
+        self.assertIn("expires_at", fields)
+        self.assertIn("kind", fields)
+
 
 
 class DeliveryAttemptModelTest(TestCase):
@@ -686,6 +718,146 @@ class DeliveryEventModelTest(TestCase):
                 safe_payload_summary={"access_token": "secret-token-123"},
             )
         self.assertIn("safe_payload_summary", ctx.exception.message_dict)
+
+    def test_safe_payload_summary_rejects_nested_forbidden_keys(self):
+        """Forbidden keys in nested dictionaries must be caught recursively."""
+        nested_payloads = [
+            {"details": {"accessToken": "secret-123"}},
+            {"meta": {"auth": {"token": "xyz"}}},
+            {"wrapper": {"payload": {"data": 1}}},
+        ]
+        for payload in nested_payloads:
+            with self.assertRaises(ValidationError) as ctx:
+                DeliveryEvent.objects.create(
+                    organization=self.org_a,
+                    report=self.report,
+                    event_type="test",
+                    source=EventSource.PLATFORM,
+                    safe_payload_summary=payload,
+                )
+            self.assertIn("safe_payload_summary", ctx.exception.message_dict)
+
+    def test_safe_payload_summary_rejects_forbidden_keys_in_lists(self):
+        """Forbidden keys within lists of objects must be caught recursively."""
+        list_payloads = [
+            {"items": [{"raw-payload": "data"}]},
+            {"records": [{"nested": [{"secret": "val"}]}]},
+        ]
+        for payload in list_payloads:
+            with self.assertRaises(ValidationError) as ctx:
+                DeliveryEvent.objects.create(
+                    organization=self.org_a,
+                    report=self.report,
+                    event_type="test",
+                    source=EventSource.PLATFORM,
+                    safe_payload_summary=payload,
+                )
+            self.assertIn("safe_payload_summary", ctx.exception.message_dict)
+
+    def test_safe_payload_summary_rejects_alternate_key_spellings(self):
+        """Case variants, hyphens, underscores, and camelCase cannot bypass checks."""
+        variant_keys = [
+            "accessToken",
+            "access_token",
+            "ACCESS_TOKEN",
+            "raw-payload",
+            "raw_payload",
+            "RawPayload",
+            "RAW-PAYLOAD",
+            "ApiKey",
+            "api_key",
+            "API-KEY",
+            "Bearer",
+            "Password",
+        ]
+        for key in variant_keys:
+            with self.assertRaises(ValidationError) as ctx:
+                DeliveryEvent.objects.create(
+                    organization=self.org_a,
+                    report=self.report,
+                    event_type="test",
+                    source=EventSource.PLATFORM,
+                    safe_payload_summary={key: "sensitive_val"},
+                )
+            self.assertIn("safe_payload_summary", ctx.exception.message_dict)
+
+    def test_safe_payload_summary_rejects_unrecognized_fields(self):
+        """Arbitrary unrecognized fields not in the documented safe summary allowlist must be rejected."""
+        unrecognized_payloads = [
+            {"arbitrary_field": "val"},
+            {"custom_meta": 123},
+            {"internal_routing_id": "route-99"},
+        ]
+        for payload in unrecognized_payloads:
+            with self.assertRaises(ValidationError) as ctx:
+                DeliveryEvent.objects.create(
+                    organization=self.org_a,
+                    report=self.report,
+                    event_type="test",
+                    source=EventSource.PLATFORM,
+                    safe_payload_summary=payload,
+                )
+            self.assertIn("safe_payload_summary", ctx.exception.message_dict)
+
+    def test_safe_payload_summary_rejects_arbitrary_nested_objects(self):
+        """Permitted keys cannot hold arbitrary nested dicts or lists."""
+        nested_objects = [
+            {"wamid": {"nested_id": "123"}},
+            {"status": ["accepted", "sent"]},
+            {"error_code": {"code": 404}},
+        ]
+        for payload in nested_objects:
+            with self.assertRaises(ValidationError) as ctx:
+                DeliveryEvent.objects.create(
+                    organization=self.org_a,
+                    report=self.report,
+                    event_type="test",
+                    source=EventSource.PLATFORM,
+                    safe_payload_summary=payload,
+                )
+            self.assertIn("safe_payload_summary", ctx.exception.message_dict)
+
+    def test_safe_payload_summary_allows_valid_safe_summaries(self):
+        """Documented safe summary fields with primitive values must succeed."""
+        valid_summaries = [
+            {},
+            {"wamid": "wamid.HBgLMTE...", "status": "delivered"},
+            {
+                "wamid": "wamid.123",
+                "status": "failed",
+                "error_code": "user_opt_out",
+                "error_message": "User has opted out of WhatsApp messages.",
+            },
+            {"status": "accepted", "timestamp": "2026-10-14T20:00:00Z"},
+            {"event_id": "evt_456", "reason": "rate_limited"},
+        ]
+        for summary in valid_summaries:
+            event = DeliveryEvent.objects.create(
+                organization=self.org_a,
+                report=self.report,
+                event_type="test_valid",
+                source=EventSource.PLATFORM,
+                safe_payload_summary=summary,
+            )
+            self.assertEqual(event.safe_payload_summary, summary)
+
+    def test_safe_payload_summary_enforced_on_save_and_clean(self):
+        """Validation is enforced both during full_clean and on direct save."""
+        event = DeliveryEvent(
+            organization=self.org_a,
+            report=self.report,
+            event_type="test",
+            source=EventSource.PLATFORM,
+            safe_payload_summary={"accessToken": "leaked_token"},
+        )
+        with self.assertRaises(ValidationError) as ctx:
+            event.full_clean()
+        self.assertIn("safe_payload_summary", ctx.exception.message_dict)
+
+        with self.assertRaises(ValidationError) as ctx:
+            event.save()
+        self.assertIn("safe_payload_summary", ctx.exception.message_dict)
+
 
 
 class DispatchOutboxModelTest(TestCase):

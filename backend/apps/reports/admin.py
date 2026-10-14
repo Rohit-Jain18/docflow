@@ -56,7 +56,7 @@ class ReportAdmin(admin.ModelAdmin):
 
 @admin.register(MediaReference)
 class MediaReferenceAdmin(admin.ModelAdmin):
-    # Sensitive reference material (encrypted_reference and download_url) is strictly excluded from list_display
+    # Sensitive reference material is strictly excluded from list_display and form/detail presentation
     list_display = (
         "id",
         "report",
@@ -66,9 +66,16 @@ class MediaReferenceAdmin(admin.ModelAdmin):
         "deleted_at",
     )
     list_filter = ("kind",)
-    search_fields = ("id", "report__id", "provider_media_id")
+    search_fields = ("id", "report__id")
     ordering = ("-created_at",)
     readonly_fields = ("id", "created_at")
+    exclude = ("encrypted_reference", "download_url", "provider_media_id")
+
+    def get_readonly_fields(self, request, obj=None):
+        if obj:
+            return self.readonly_fields + ("report", "kind")
+        return self.readonly_fields
+
 
 
 @admin.register(DeliveryAttempt)
