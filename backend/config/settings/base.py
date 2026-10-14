@@ -143,4 +143,12 @@ NUM_PROXIES = 0
 DOCFLOW_NUM_PROXIES = 0
 DOCFLOW_TRUSTED_PROXIES = ()
 
+# ---------------------------------------------------------------------------
+# Development Account Verification Override (disabled by default)
+# ---------------------------------------------------------------------------
+DEV_ACCOUNT_VERIFICATION_OVERRIDE = False
+DEV_TEST_ORGANIZATION_ID = ""
+DEV_TEST_ACCOUNT_ID = ""
+
+
 

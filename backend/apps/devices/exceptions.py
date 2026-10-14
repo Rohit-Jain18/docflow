@@ -38,6 +38,7 @@ ERROR_TITLES: Dict[int, str] = {
     status.HTTP_415_UNSUPPORTED_MEDIA_TYPE: "Unsupported media type",
     status.HTTP_429_TOO_MANY_REQUESTS: "Rate limited",
     status.HTTP_500_INTERNAL_SERVER_ERROR: "Internal server error",
+    status.HTTP_503_SERVICE_UNAVAILABLE: "Provider unavailable",
 }
 
 DEFAULT_ERROR_CODES: Dict[int, str] = {
@@ -51,6 +52,7 @@ DEFAULT_ERROR_CODES: Dict[int, str] = {
     status.HTTP_415_UNSUPPORTED_MEDIA_TYPE: "unsupported_media_type",
     status.HTTP_429_TOO_MANY_REQUESTS: "rate_limited",
     status.HTTP_500_INTERNAL_SERVER_ERROR: "internal_error",
+    status.HTTP_503_SERVICE_UNAVAILABLE: "provider_unavailable",
 }
 
 
