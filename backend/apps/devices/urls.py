@@ -9,6 +9,7 @@ Routes:
 
 from django.urls import re_path
 
+from .agent_views import AgentConfigView, AgentHeartbeatView
 from .management_views import (
     DeviceActivationCodeIssueView,
     DeviceDetailUpdateView,
@@ -35,6 +36,16 @@ urlpatterns = [
         r"^agent/auth/revoke-self/?$",
         RevokeSelfView.as_view(),
         name="agent-auth-revoke-self",
+    ),
+    re_path(
+        r"^agent/config/?$",
+        AgentConfigView.as_view(),
+        name="agent-config",
+    ),
+    re_path(
+        r"^agent/heartbeat/?$",
+        AgentHeartbeatView.as_view(),
+        name="agent-heartbeat",
     ),
     # Human Device Management APIs (Phase 1, Task 3E)
     re_path(

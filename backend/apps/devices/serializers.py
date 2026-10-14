@@ -248,3 +248,74 @@ class DeviceRevokeSerializer(serializers.Serializer):
             )
         return val
 
+
+class QueueCountsSerializer(serializers.Serializer):
+    """Validate queue_counts object in heartbeat telemetry."""
+
+    queued = serializers.IntegerField(min_value=0, max_value=1_000_000, required=True)
+    retry_wait = serializers.IntegerField(min_value=0, max_value=1_000_000, required=True)
+    quarantined = serializers.IntegerField(min_value=0, max_value=1_000_000, required=True)
+
+    def to_internal_value(self, data):
+        if not isinstance(data, dict):
+            raise serializers.ValidationError({"detail": "queue_counts must be a JSON object."})
+        allowed = {"queued", "retry_wait", "quarantined"}
+        unknown = set(data.keys()) - allowed
+        if unknown:
+            raise serializers.ValidationError(
+                {k: ["Unexpected field in queue_counts."] for k in sorted(unknown)}
+            )
+        return super().to_internal_value(data)
+
+
+class AgentHeartbeatSerializer(serializers.Serializer):
+    """
+    Validate POST /api/v1/agent/heartbeat request payload.
+    Accepts exactly: agent_version, installation_id, service_state, queue_counts, and optional last_successful_job_at.
+    """
+
+    agent_version = serializers.CharField(
+        max_length=50,
+        required=True,
+        allow_blank=False,
+        trim_whitespace=True,
+    )
+    installation_id = serializers.CharField(
+        max_length=255,
+        required=True,
+        allow_blank=False,
+        trim_whitespace=True,
+    )
+    service_state = serializers.CharField(
+        max_length=50,
+        required=True,
+        allow_blank=False,
+        trim_whitespace=True,
+    )
+    queue_counts = QueueCountsSerializer(required=True)
+    last_successful_job_at = serializers.DateTimeField(
+        required=False,
+        allow_null=True,
+        default=None,
+    )
+
+    def to_internal_value(self, data):
+        if not isinstance(data, dict):
+            raise serializers.ValidationError(
+                {"detail": "Invalid request payload; expected JSON object."}
+            )
+        allowed = {
+            "agent_version",
+            "installation_id",
+            "service_state",
+            "queue_counts",
+            "last_successful_job_at",
+        }
+        unknown = set(data.keys()) - allowed
+        if unknown:
+            raise serializers.ValidationError(
+                {k: ["Unexpected field."] for k in sorted(unknown)}
+            )
+        return super().to_internal_value(data)
+
+

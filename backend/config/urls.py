@@ -8,5 +8,6 @@ urlpatterns = [
     path("api/v1/", include("apps.users.urls")),
     path("api/v1/", include("apps.tenants.urls")),
     path("api/v1/", include("apps.whatsapp.urls")),
+    path("api/v1/", include("apps.reports.urls")),
 ]
 
