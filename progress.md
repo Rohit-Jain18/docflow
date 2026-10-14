@@ -239,3 +239,28 @@
 - **Open issues/blockers:** None for Task 2A. External WhatsApp contracts (OQ-001–OQ-010) remain deferred to Phase 3+.
 - **Next step:** Phase 1 Task 2A complete. Awaiting approval for Phase 1 Task 2B (Device & activation models, or next planned model batch).
 
+## 2026-10-14T21:25:00+05:30 — Phase 1 Task 2B: Device and Credential Models
+
+- **Phase / task:** Phase 1 / Task 2B — Device, DeviceActivationCode, and DeviceRefreshCredential models, migrations, admin registration, tenant consistency validation, credential hashing protections, and unit tests.
+- **Goal:** Implement minimal device domain abstractions per DATA_MODEL.md §2 and SECURITY.md §3, enforcing cross-table tenant consistency (device branch must belong to device organization; activation code org, branch, and device must agree; replacement refresh credential must belong to same device) and strictly protecting secrets by storing only hashes.
+- **Inspection:** Inspected Git status, CLAUDE.md, backend/config/settings/base.py, apps/tenants/models.py, docs/DATA_MODEL.md §2, docs/SECURITY.md §3.
+- **Changes:**
+  - `backend/config/settings/base.py`: Registered `apps.devices` in `INSTALLED_APPS`.
+  - `backend/apps/devices/__init__.py`: Package init.
+  - `backend/apps/devices/apps.py`: DevicesConfig AppConfig.
+  - `backend/apps/devices/models.py`: Created `Device` (UUID PK, organization FK, branch FK, name, status choices, agent_version, windows platform default, last_seen_at, last_ip, activated_at, revoked_at, timestamps, tenant consistency validation, and organization immutability), `DeviceActivationCode` (UUID PK, organization FK, branch FK, device FK, created_by FK, unique code_hash, default 10-minute expiry, consumed_at, attempt_count, revoked_at, timestamps, mutual consistency validation, helper properties `is_valid`/`is_consumed`/`is_revoked`/`is_expired`), and `DeviceRefreshCredential` (UUID PK, device FK, unique credential_hash, issued_at, expires_at, rotated_at, revoked_at, replaced_by OneToOne self-reference, same-device rotation validation, helper properties `is_active`/`is_rotated`/`is_revoked`/`is_expired`).
+  - `backend/apps/devices/admin.py`: Registered `DeviceAdmin`, `DeviceActivationCodeAdmin`, and `DeviceRefreshCredentialAdmin`, strictly excluding `code_hash` and `credential_hash` from `list_display` and making `organization` read-only on existing Device instances.
+  - `backend/apps/devices/migrations/0001_initial.py`: Migration generated and applied cleanly against development SQLite database.
+  - `backend/tests/test_device_models.py`: 25 unit tests covering model creation, UUID PKs, choices, hash uniqueness, expiry calculations, mutual tenant consistency on save/clean, credential hash protections, rotation chaining, and admin security.
+- **Why:** Establish client PC identity and authentication credential storage per DATA_MODEL.md §2 and SECURITY.md §3 without storing raw secrets or allowing cross-tenant device bindings.
+- **Commands run:**
+  - `& "...\backend\.venv\Scripts\python.exe" manage.py check --settings=config.settings.development` — System check identified no issues (0 silenced).
+  - `& "...\backend\.venv\Scripts\python.exe" manage.py makemigrations devices --settings=config.settings.development` — Created `apps/devices/migrations/0001_initial.py`.
+  - `& "...\backend\.venv\Scripts\python.exe" manage.py migrate --settings=config.settings.development` — Applied `devices.0001_initial` OK.
+  - `& "...\backend\.venv\Scripts\python.exe" manage.py test tests --settings=config.settings.development --verbosity=2` — Ran 99 tests in 32.976s — OK.
+- **Tests/checks:** 99 tests run (14 user + 25 config + 35 tenant + 25 device), 0 failures. System check 0 issues.
+- **Security/reliability checks:** Raw activation codes and refresh secrets are never stored (hashes only); hashes excluded from admin list displays; cross-organization branches on devices and activation codes are rejected with `ValidationError`; replacement refresh credentials must belong to the same device; device organization cannot be mutated after persistence.
+- **Decisions:** Activation code initial expiry defaults to 10 minutes (`get_default_activation_code_expiry`); `replaced_by` uses `OneToOneField` self-reference for linear rotation chains; `code_hash` and `credential_hash` are unique CharFields.
+- **Open issues/blockers:** None for Task 2B. External WhatsApp contracts (OQ-001–OQ-010) remain deferred to Phase 3+.
+- **Next step:** Phase 1 Task 2B complete. Awaiting approval for Phase 1 Task 2C (WhatsApp account & assignment models, or next planned model batch).
+
