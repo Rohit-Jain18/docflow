@@ -8,10 +8,15 @@ Enforces:
   - PII data minimization (client_tracking_label must not leak recipient phone number).
 """
 
+import datetime
 import re
+import urllib.parse
+
+from django.conf import settings
+from django.utils import timezone as tz_utils
 from rest_framework import serializers
 
-from .models import DocumentType, ReportStatus
+from .models import DocumentType, MediaKind, ReportStatus
 
 HEX_64_REGEX = re.compile(r"^[0-9a-f]{64}$")
 E164_REGEX = re.compile(r"^\+[1-9]\d{6,14}$")
@@ -173,12 +178,6 @@ class MediaReferenceDataSerializer(serializers.Serializer):
         return super().to_internal_value(data)
 
     def validate(self, attrs):
-        import datetime
-        import urllib.parse
-        from django.conf import settings
-        from django.utils import timezone as tz_utils
-        from .models import MediaKind
-
         kind = attrs.get("kind", "").strip()
 
         if kind == MediaKind.DEVELOPMENT_DOWNLOAD_URL:

@@ -23,10 +23,12 @@ Validates:
 """
 
 import datetime
+import uuid
 from unittest.mock import patch
 from django.core.cache import cache
 from django.db import IntegrityError
 from django.test import TestCase, override_settings
+from django.urls import Resolver404, resolve, reverse
 from django.utils import timezone as tz_utils
 from rest_framework import status
 from rest_framework.test import APIClient
@@ -43,6 +45,11 @@ from apps.reports.models import (
     OutboxState,
     Report,
     ReportStatus,
+)
+from apps.reports.views import (
+    AgentMediaReferenceAttachmentView,
+    AgentReportDetailView,
+    AgentReportRegistrationView,
 )
 from apps.tenants.models import (
     Branch,
@@ -899,3 +906,130 @@ class AgentReportListTests(AgentMediaAndStatusBaseTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data["results"]), 1)
         self.assertEqual(response.data["results"][0]["last_safe_error_code"], "phone_not_registered")
+
+
+# ==============================================================================
+# 4. Report API URL Routing Resolution Tests
+# ==============================================================================
+
+
+class ReportURLRoutingTests(TestCase):
+    """
+    Validates URL routing configuration for Agent Report APIs under /api/v1/.
+
+    Ensures Django root URL configuration resolves all required actual paths:
+      - POST /api/v1/agent/reports
+      - GET  /api/v1/agent/reports
+      - PUT  /api/v1/agent/reports/{report_id}/media-reference
+      - GET  /api/v1/agent/reports/{report_id}
+
+    Verifies routes resolve to intended view classes, without duplicate or
+    conflicting patterns, and strictly reject malformed or non-UUID route parameters.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.client = APIClient()
+        self.sample_report_id = uuid.uuid4()
+
+    def test_resolve_agent_reports_collection_post_and_get(self):
+        """POST and GET /api/v1/agent/reports resolve to AgentReportRegistrationView."""
+        path = "/api/v1/agent/reports"
+        match = resolve(path)
+        self.assertEqual(match.func.view_class, AgentReportRegistrationView)
+        self.assertEqual(match.url_name, "agent-report-list-create")
+        self.assertTrue(hasattr(AgentReportRegistrationView, "post"))
+        self.assertTrue(hasattr(AgentReportRegistrationView, "get"))
+
+        # Optional trailing slash resolves to the same view
+        match_slash = resolve("/api/v1/agent/reports/")
+        self.assertEqual(match_slash.func.view_class, AgentReportRegistrationView)
+        self.assertEqual(match_slash.url_name, "agent-report-list-create")
+
+    def test_resolve_agent_reports_media_reference_put(self):
+        """PUT /api/v1/agent/reports/{report_id}/media-reference resolves to AgentMediaReferenceAttachmentView."""
+        path = f"/api/v1/agent/reports/{self.sample_report_id}/media-reference"
+        match = resolve(path)
+        self.assertEqual(match.func.view_class, AgentMediaReferenceAttachmentView)
+        self.assertEqual(match.url_name, "agent-report-media-reference-attach")
+        self.assertEqual(match.kwargs["report_id"], str(self.sample_report_id))
+        self.assertTrue(hasattr(AgentMediaReferenceAttachmentView, "put"))
+
+        # Optional trailing slash resolves to the same view
+        match_slash = resolve(f"{path}/")
+        self.assertEqual(match_slash.func.view_class, AgentMediaReferenceAttachmentView)
+        self.assertEqual(match_slash.kwargs["report_id"], str(self.sample_report_id))
+
+    def test_resolve_agent_reports_detail_get(self):
+        """GET /api/v1/agent/reports/{report_id} resolves to AgentReportDetailView."""
+        path = f"/api/v1/agent/reports/{self.sample_report_id}"
+        match = resolve(path)
+        self.assertEqual(match.func.view_class, AgentReportDetailView)
+        self.assertEqual(match.url_name, "agent-report-detail")
+        self.assertEqual(match.kwargs["report_id"], str(self.sample_report_id))
+        self.assertTrue(hasattr(AgentReportDetailView, "get"))
+
+        # Optional trailing slash resolves to the same view
+        match_slash = resolve(f"{path}/")
+        self.assertEqual(match_slash.func.view_class, AgentReportDetailView)
+        self.assertEqual(match_slash.kwargs["report_id"], str(self.sample_report_id))
+
+    def test_reverse_agent_report_urls(self):
+        """Named URL patterns reverse to exact expected path strings."""
+        self.assertEqual(reverse("agent-report-list-create"), "/api/v1/agent/reports")
+        self.assertEqual(
+            reverse("agent-report-media-reference-attach", kwargs={"report_id": self.sample_report_id}),
+            f"/api/v1/agent/reports/{self.sample_report_id}/media-reference",
+        )
+        self.assertEqual(
+            reverse("agent-report-detail", kwargs={"report_id": self.sample_report_id}),
+            f"/api/v1/agent/reports/{self.sample_report_id}",
+        )
+
+    def test_malformed_and_conflicting_paths_fail_resolution(self):
+        """Non-UUID identifiers and malformed paths do not resolve to report views."""
+        invalid_paths = [
+            "/api/v1/agent/reports/not-a-valid-uuid",
+            "/api/v1/agent/reports/12345/media-reference",
+            "/api/v1/agent/reports/not-a-uuid/media-reference",
+            f"/api/v1/agent/reports/{self.sample_report_id}/non-existent-action",
+            "/api/v1/agent/reports/extra/nested/path",
+        ]
+        for path in invalid_paths:
+            with self.assertRaises(Resolver404, msg=f"Path {path} should not resolve"):
+                resolve(path)
+
+    def test_http_methods_hit_endpoints_through_django_routing(self):
+        """
+        Verify live HTTP routing reaches the intended views via Django test client.
+        Unauthenticated requests reach the view and are rejected by DeviceBearerAuthentication
+        with 401 (not 404), proving the router dispatches to the correct handler.
+        """
+        # POST /api/v1/agent/reports
+        resp_post_create = self.client.post("/api/v1/agent/reports", {}, format="json")
+        self.assertEqual(resp_post_create.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(resp_post_create.data["code"], "authentication_required")
+
+        # GET /api/v1/agent/reports
+        resp_get_list = self.client.get("/api/v1/agent/reports")
+        self.assertEqual(resp_get_list.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(resp_get_list.data["code"], "authentication_required")
+
+        # PUT /api/v1/agent/reports/{report_id}/media-reference
+        resp_put_media = self.client.put(
+            f"/api/v1/agent/reports/{self.sample_report_id}/media-reference",
+            {},
+            format="json",
+        )
+        self.assertEqual(resp_put_media.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(resp_put_media.data["code"], "authentication_required")
+
+        # GET /api/v1/agent/reports/{report_id}
+        resp_get_detail = self.client.get(f"/api/v1/agent/reports/{self.sample_report_id}")
+        self.assertEqual(resp_get_detail.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(resp_get_detail.data["code"], "authentication_required")
+
+        # In contrast, non-UUID route fails resolution with 404
+        resp_invalid_uuid = self.client.get("/api/v1/agent/reports/not-a-uuid")
+        self.assertEqual(resp_invalid_uuid.status_code, status.HTTP_404_NOT_FOUND)
+

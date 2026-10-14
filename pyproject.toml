@@ -1,0 +1,12 @@
+[tool.pyrefly]
+search-path = [
+    "backend"
+]
+python-interpreter-path = "backend/.venv/Scripts/python.exe"
+
+[tool.pyright]
+include = ["backend"]
+extraPaths = ["backend"]
+pythonVersion = "3.13"
+venvPath = "backend"
+venv = ".venv"
