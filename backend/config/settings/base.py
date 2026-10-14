@@ -150,5 +150,13 @@ DEV_ACCOUNT_VERIFICATION_OVERRIDE = False
 DEV_TEST_ORGANIZATION_ID = ""
 DEV_TEST_ACCOUNT_ID = ""
 
+# ---------------------------------------------------------------------------
+# Temporary Upload Configuration (development only)
+# ---------------------------------------------------------------------------
+TEMP_UPLOAD_MODE = "disabled"
+TEMP_UPLOAD_FICTIONAL_DATA_ONLY = False
+TEMP_UPLOAD_EXPECTED_HOST = "tmpfiles.org"
+TEMP_UPLOAD_EXPIRY_BUFFER_SECONDS = 300  # 5 minutes safety buffer
+
 
 

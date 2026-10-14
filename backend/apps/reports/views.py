@@ -17,7 +17,11 @@ Enforces:
 import re
 import uuid
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
+from django.http import Http404
+from django.shortcuts import get_object_or_404
+from django.utils import timezone as tz_utils
 from rest_framework import status
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated
@@ -26,14 +30,28 @@ from rest_framework.views import APIView
 
 from apps.audit.models import AuditAction, AuditEvent
 from apps.devices.authentication import DeviceBearerAuthentication
+from apps.devices.models import DeviceStatus
 from apps.tenants.models import BranchStatus, LabStatus, OrganizationStatus
+from apps.tenants.pagination import DocflowPagination
 from apps.whatsapp.models import (
     AssignmentStatus,
     BranchWhatsAppAssignment,
     WhatsAppAccountStatus,
 )
-from .models import Report, ReportStatus
-from .serializers import AgentReportCreateSerializer
+from .models import (
+    DeliveryAttempt,
+    DispatchOutbox,
+    MediaKind,
+    MediaReference,
+    OutboxState,
+    Report,
+    ReportStatus,
+)
+from .serializers import (
+    AgentReportCreateSerializer,
+    AgentReportListQuerySerializer,
+    MediaReferenceAttachmentSerializer,
+)
 
 HEX_64_REGEX = re.compile(r"^[0-9a-f]{64}$")
 
@@ -60,6 +78,10 @@ class AgentReportRegistrationView(APIView):
 
     authentication_classes = [DeviceBearerAuthentication]
     permission_classes = [IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        """GET /api/v1/agent/reports - List reports for the authenticated agent."""
+        return AgentReportListView().get(request, *args, **kwargs)
 
     def post(self, request, *args, **kwargs):
         device = request.user
@@ -362,3 +384,388 @@ class AgentReportRegistrationView(APIView):
                     "request_id": request_id,
                 },
             }
+
+
+class AgentMediaReferenceAttachmentView(APIView):
+    """
+    PUT /api/v1/agent/reports/{report_id}/media-reference
+
+    Attaches a validated media reference to an existing queued report.
+    Transitions report queued -> uploaded, creates the first DeliveryAttempt
+    and DispatchOutbox entry in a single atomic transaction.
+    """
+
+    authentication_classes = [DeviceBearerAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def put(self, request, report_id, *args, **kwargs):
+        device = request.user
+        request_id = _get_request_id(request)
+
+        # 1. Scope report to authenticated device's authorized branch/tenant
+        try:
+            report = Report.objects.filter(
+                organization=device.organization,
+                branch=device.branch,
+                id=report_id,
+            ).first()
+        except (ValidationError, ValueError):
+            report = None
+
+        if not report:
+            raise Http404("Report not found or outside device scope.")
+
+        # 2. Validate request payload
+        serializer = MediaReferenceAttachmentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        media_data = serializer.validated_data["media_reference"]
+        kind = media_data["kind"]
+
+        # 3. Provider media reference check
+        if kind in (MediaKind.PROVIDER_MEDIA_ID, MediaKind.PROVIDER_UPLOAD_REFERENCE):
+            res = Response(
+                {
+                    "type": "about:blank",
+                    "title": "Provider unavailable",
+                    "status": status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "code": "provider_unavailable",
+                    "detail": "Provider media reference contract is pending confirmation.",
+                    "request_id": request_id,
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+            res["X-Request-ID"] = request_id
+            return res
+
+        url = media_data.get("url", "").strip()
+        expires_at = media_data.get("expires_at")
+
+        # 4. Atomic Attachment and Outbox creation
+        with transaction.atomic():
+            locked_report = (
+                Report.objects.select_for_update()
+                .filter(id=report.id)
+                .first()
+            )
+
+            # Recheck tenant hierarchy
+            if (
+                device.organization.status != OrganizationStatus.ACTIVE
+                or device.branch.status != BranchStatus.ACTIVE
+                or not device.branch.lab
+                or device.branch.lab.status != LabStatus.ACTIVE
+                or device.status != DeviceStatus.ACTIVE
+            ):
+                raise PermissionDenied("Device organization, branch, or lab is inactive.")
+
+            # Recheck branch assignment
+            if not locked_report.branch_assignment_id:
+                res = Response(
+                    {
+                        "type": "about:blank",
+                        "title": "Account not verified",
+                        "status": status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        "code": "account_not_verified",
+                        "detail": "No WhatsApp sender assignment found on report.",
+                        "request_id": request_id,
+                    },
+                    status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                )
+                res["X-Request-ID"] = request_id
+                return res
+
+            assignment = (
+                BranchWhatsAppAssignment.objects.select_for_update()
+                .filter(id=locked_report.branch_assignment_id)
+                .select_related("whatsapp_account")
+                .first()
+            )
+
+            if not assignment or assignment.status != AssignmentStatus.ACTIVE:
+                res = Response(
+                    {
+                        "type": "about:blank",
+                        "title": "Account not verified",
+                        "status": status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        "code": "account_not_verified",
+                        "detail": "Original branch WhatsApp assignment is inactive.",
+                        "request_id": request_id,
+                    },
+                    status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                )
+                res["X-Request-ID"] = request_id
+                return res
+
+            # Recheck that the branch currently still has this active assignment
+            current_active = (
+                BranchWhatsAppAssignment.objects.select_for_update()
+                .filter(branch=device.branch, status=AssignmentStatus.ACTIVE)
+                .first()
+            )
+            if not current_active or current_active.id != locked_report.branch_assignment_id:
+                res = Response(
+                    {
+                        "type": "about:blank",
+                        "title": "Account not verified",
+                        "status": status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        "code": "account_not_verified",
+                        "detail": "Branch WhatsApp assignment has changed since report registration.",
+                        "request_id": request_id,
+                    },
+                    status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                )
+                res["X-Request-ID"] = request_id
+                return res
+
+            # Check WhatsApp account status
+            account = assignment.whatsapp_account
+            if not account or account.status != WhatsAppAccountStatus.VERIFIED:
+                res = Response(
+                    {
+                        "type": "about:blank",
+                        "title": "Account not verified",
+                        "status": status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        "code": "account_not_verified",
+                        "detail": "Assigned WhatsApp account is not verified.",
+                        "request_id": request_id,
+                    },
+                    status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                )
+                res["X-Request-ID"] = request_id
+                return res
+
+            # Production mode fail-closed
+            is_production = getattr(settings, "DOCFLOW_ENV", "") == "production"
+            if is_production:
+                is_dev_override = AuditEvent.objects.filter(
+                    target_type="whatsapp_account",
+                    target_id=str(account.id),
+                    action=AuditAction.WHATSAPP_ACCOUNT_DEV_VERIFICATION_OVERRIDE,
+                ).exists()
+                if is_dev_override:
+                    res = Response(
+                        {
+                            "type": "about:blank",
+                            "title": "Account not verified",
+                            "status": status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            "code": "account_not_verified",
+                            "detail": "WhatsApp account verified via development override is disallowed in production.",
+                            "request_id": request_id,
+                        },
+                        status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    )
+                    res["X-Request-ID"] = request_id
+                    return res
+
+            # Check existing MediaReference on the report
+            existing_media = locked_report.media_references.filter(deleted_at__isnull=True).first()
+            if existing_media:
+                if existing_media.kind == kind and existing_media.download_url == url:
+                    res = Response(
+                        {
+                            "report_id": str(locked_report.id),
+                            "status": locked_report.status,
+                            "duplicate": True,
+                        },
+                        status=status.HTTP_200_OK,
+                    )
+                    res["X-Request-ID"] = request_id
+                    return res
+                else:
+                    res = Response(
+                        {
+                            "type": "about:blank",
+                            "title": "State conflict",
+                            "status": status.HTTP_409_CONFLICT,
+                            "code": "state_conflict",
+                            "detail": "A different media reference cannot replace the existing reference.",
+                            "request_id": request_id,
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    )
+                    res["X-Request-ID"] = request_id
+                    return res
+
+            # Ensure report is in QUEUED state
+            if locked_report.status != ReportStatus.QUEUED:
+                res = Response(
+                    {
+                        "type": "about:blank",
+                        "title": "State conflict",
+                        "status": status.HTTP_409_CONFLICT,
+                        "code": "state_conflict",
+                        "detail": f"Report in status '{locked_report.status}' is ineligible for media attachment.",
+                        "request_id": request_id,
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+                res["X-Request-ID"] = request_id
+                return res
+
+            # Create MediaReference
+            MediaReference.objects.create(
+                report=locked_report,
+                kind=kind,
+                download_url=url,
+                expires_at=expires_at,
+                encrypted_reference="",
+            )
+
+            # Transition status queued -> uploaded
+            locked_report.status = ReportStatus.UPLOADED
+            locked_report.save(update_fields=["status", "updated_at"])
+
+            # Create first DeliveryAttempt if not exists
+            attempt, _ = DeliveryAttempt.objects.get_or_create(
+                report=locked_report,
+                attempt_number=1,
+                defaults={
+                    "organization": locked_report.organization,
+                    "status": ReportStatus.QUEUED,
+                    "provider_key": account.provider_key or "kiziee",
+                },
+            )
+
+            # Create DispatchOutbox item if not exists
+            DispatchOutbox.objects.get_or_create(
+                report=locked_report,
+                delivery_attempt=attempt,
+                defaults={
+                    "organization": locked_report.organization,
+                    "event_type": "send_message",
+                    "state": OutboxState.PENDING,
+                    "available_at": tz_utils.now(),
+                },
+            )
+
+            res = Response(
+                {
+                    "report_id": str(locked_report.id),
+                    "status": "uploaded",
+                    "duplicate": False,
+                },
+                status=status.HTTP_200_OK,
+            )
+            res["X-Request-ID"] = request_id
+            return res
+
+
+class AgentReportDetailView(APIView):
+    """
+    GET /api/v1/agent/reports/{report_id}
+
+    Returns safe report status and delivery attempt summary.
+    Scoped strictly to the authenticated device's authorized branch/tenant.
+    """
+
+    authentication_classes = [DeviceBearerAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, report_id, *args, **kwargs):
+        device = request.user
+        request_id = _get_request_id(request)
+
+        try:
+            report = Report.objects.filter(
+                organization=device.organization,
+                branch=device.branch,
+                id=report_id,
+            ).first()
+        except (ValidationError, ValueError):
+            report = None
+
+        if not report:
+            raise Http404("Report not found or outside device scope.")
+
+        latest_attempt = report.delivery_attempts.order_by("-attempt_number").first()
+
+        last_safe_error = None
+        if latest_attempt and latest_attempt.error_code:
+            last_safe_error = latest_attempt.error_code
+        elif report.quarantined_reason_code:
+            last_safe_error = report.quarantined_reason_code
+
+        data = {
+            "report_id": str(report.id),
+            "status": report.status,
+            "created_at": report.created_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "updated_at": report.updated_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "last_safe_error_code": last_safe_error,
+        }
+
+        if latest_attempt:
+            data["delivery_attempt"] = {
+                "attempt_number": latest_attempt.attempt_number,
+                "status": latest_attempt.status,
+                "provider_message_id": latest_attempt.provider_message_id or None,
+                "updated_at": latest_attempt.updated_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "last_safe_error_code": latest_attempt.error_code or None,
+            }
+
+        res = Response(data, status=status.HTTP_200_OK)
+        res["X-Request-ID"] = request_id
+        return res
+
+
+class AgentReportListView(APIView):
+    """
+    GET /api/v1/agent/reports?status=...&since=...&page=...&page_size=...
+
+    Returns paginated safe report status summaries scoped to device's branch/tenant.
+    """
+
+    authentication_classes = [DeviceBearerAuthentication]
+    permission_classes = [IsAuthenticated]
+    pagination_class = DocflowPagination
+
+    def get(self, request, *args, **kwargs):
+        device = request.user
+        request_id = _get_request_id(request)
+
+        # Validate query parameters
+        query_serializer = AgentReportListQuerySerializer(data=request.query_params)
+        query_serializer.is_valid(raise_exception=True)
+
+        queryset = (
+            Report.objects.filter(
+                organization=device.organization,
+                branch=device.branch,
+            )
+            .prefetch_related("delivery_attempts")
+            .order_by("-created_at", "-id")
+        )
+
+        filter_status = query_serializer.validated_data.get("status")
+        if filter_status:
+            queryset = queryset.filter(status=filter_status)
+
+        since = query_serializer.validated_data.get("since")
+        if since:
+            queryset = queryset.filter(created_at__gte=since)
+
+        paginator = self.pagination_class()
+        page = paginator.paginate_queryset(queryset, request, view=self)
+
+        results = []
+        for r in page:
+            attempts = list(r.delivery_attempts.all())
+            latest_attempt = max(attempts, key=lambda a: a.attempt_number) if attempts else None
+            last_safe_error = None
+            if latest_attempt and latest_attempt.error_code:
+                last_safe_error = latest_attempt.error_code
+            elif r.quarantined_reason_code:
+                last_safe_error = r.quarantined_reason_code
+
+            results.append({
+                "report_id": str(r.id),
+                "status": r.status,
+                "created_at": r.created_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "updated_at": r.updated_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "last_safe_error_code": last_safe_error,
+            })
+
+        paginated_response = paginator.get_paginated_response(results)
+        paginated_response["X-Request-ID"] = request_id
+        return paginated_response
+
+
