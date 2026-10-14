@@ -522,6 +522,7 @@ def exchange_activation_code(
     if failure_error:
         raise failure_error
 
+    assert result is not None, "Activation exchange did not produce a result."
     return result
 
 
@@ -674,6 +675,7 @@ def rotate_refresh_token(
     if failure_error:
         raise failure_error
 
+    assert result is not None, "Token rotation did not produce a result."
     return result
 
 
