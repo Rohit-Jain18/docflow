@@ -126,6 +126,44 @@ class ActivationResult:
         )
 
 
+def _parse_utc_iso_timestamp(raw_val: Any, field_name: str) -> datetime:
+    """Parse and validate an ISO 8601 UTC timestamp ending in 'Z'.
+
+    Per docs/API_CONTRACTS.md §1 & §3:
+    Rejects:
+      - None, non-strings, or empty/whitespace strings
+      - Naive timestamps without timezone
+      - Non-UTC offset strings (e.g. +05:30, -04:00, or non-Z UTC offsets)
+      - Malformed or invalid ISO 8601 timestamp representations
+    Never echoes raw server-controlled values in exception messages.
+    """
+    if not isinstance(raw_val, str) or not raw_val.strip():
+        raise ActivationValidationError(
+            f"Field '{field_name}' is missing or empty.",
+            code="missing_timestamp",
+        )
+    cleaned = raw_val.strip()
+    if not cleaned.endswith("Z") or "T" not in cleaned:
+        raise ActivationValidationError(
+            f"Field '{field_name}' must be an ISO 8601 UTC timestamp ending in 'Z'.",
+            code="invalid_timestamp",
+        )
+    try:
+        dt = datetime.fromisoformat(cleaned)
+    except (ValueError, TypeError):
+        raise ActivationValidationError(
+            f"Field '{field_name}' is not a valid ISO 8601 timestamp.",
+            code="invalid_timestamp",
+        ) from None
+
+    if dt.tzinfo is None or dt.utcoffset() != timezone.utc.utcoffset(dt):
+        raise ActivationValidationError(
+            f"Field '{field_name}' must be a UTC timestamp.",
+            code="invalid_timestamp",
+        )
+    return dt
+
+
 # ---------------------------------------------------------------------------
 # Activation Service
 # ---------------------------------------------------------------------------
@@ -348,7 +386,7 @@ class ActivationService:
         raw_status = raw_device.get("status")
         if raw_status != "active":
             raise ActivationValidationError(
-                f"Device status is '{raw_status}'; expected 'active'.",
+                "Device status is invalid; expected 'active'.",
                 code="device_not_active",
             )
 
@@ -381,19 +419,10 @@ class ActivationService:
                 code="missing_access_token",
             )
 
-        raw_access_expires = data.get("access_token_expires_at")
-        if not isinstance(raw_access_expires, str) or not raw_access_expires.strip():
-            raise ActivationValidationError(
-                "Activation response missing valid 'access_token_expires_at'.",
-                code="missing_access_token_expiry",
-            )
-        try:
-            access_expires_dt = datetime.fromisoformat(raw_access_expires.strip())
-        except (ValueError, TypeError):
-            raise ActivationValidationError(
-                "Field 'access_token_expires_at' is not a valid ISO 8601 timestamp.",
-                code="invalid_timestamp",
-            ) from None
+        access_expires_dt = _parse_utc_iso_timestamp(
+            data.get("access_token_expires_at"),
+            "access_token_expires_at",
+        )
 
         # 3. Validate refresh token
         refresh_token = data.get("refresh_token")
@@ -403,19 +432,10 @@ class ActivationService:
                 code="missing_refresh_token",
             )
 
-        raw_refresh_expires = data.get("refresh_token_expires_at")
-        if not isinstance(raw_refresh_expires, str) or not raw_refresh_expires.strip():
-            raise ActivationValidationError(
-                "Activation response missing valid 'refresh_token_expires_at'.",
-                code="missing_refresh_token_expiry",
-            )
-        try:
-            refresh_expires_dt = datetime.fromisoformat(raw_refresh_expires.strip())
-        except (ValueError, TypeError):
-            raise ActivationValidationError(
-                "Field 'refresh_token_expires_at' is not a valid ISO 8601 timestamp.",
-                code="invalid_timestamp",
-            ) from None
+        refresh_expires_dt = _parse_utc_iso_timestamp(
+            data.get("refresh_token_expires_at"),
+            "refresh_token_expires_at",
+        )
 
         # 4. Validate configuration_version
         raw_config_ver = data.get("configuration_version")
@@ -454,8 +474,8 @@ class ActivationService:
         for k, v in settings_to_store.items():
             try:
                 self._queue.set_setting(k, v)
-            except Exception as exc:
-                logger.debug("Failed to store setting '%s' in queue: %s", k, exc)
+            except Exception:
+                logger.debug("Failed to store setting '%s' in queue", k)
 
 
 # ---------------------------------------------------------------------------

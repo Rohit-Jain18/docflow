@@ -42,16 +42,17 @@ def _cmd_version(args: argparse.Namespace) -> int:
 
 def _cmd_activate(args: argparse.Namespace) -> int:
     """Activate agent device using a one-time activation code."""
+    _ = args
+    import getpass
+
     from docflow_agent.config import load_config
     from docflow_agent.queue import JobQueue
 
-    code = getattr(args, "activation_code", None)
-    if not code:
-        try:
-            import getpass
-            code = getpass.getpass("Enter one-time activation code: ").strip()
-        except Exception:
-            code = input("Enter one-time activation code: ").strip()
+    try:
+        code = getpass.getpass("Enter one-time activation code: ").strip()
+    except Exception:
+        print("Error: Secure prompting is unavailable. Cannot prompt for activation code.", file=sys.stderr)
+        return 1
 
     if not code:
         print("Error: Activation code is required.", file=sys.stderr)
@@ -130,11 +131,6 @@ def main(argv: list[str] | None = None) -> int:
     activate_parser = subparsers.add_parser(
         "activate",
         help="Activate agent device using a one-time activation code.",
-    )
-    activate_parser.add_argument(
-        "--code",
-        dest="activation_code",
-        help="One-time activation code (prompts securely if omitted).",
     )
     activate_parser.set_defaults(func=_cmd_activate)
 

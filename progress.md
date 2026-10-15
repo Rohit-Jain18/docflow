@@ -396,4 +396,108 @@
 - **Open issues/blockers:** None for Task 2A. Local SQLite schema migrations, stable-file watcher, and phone parsing deferred to subsequent Phase 2 tasks.
 - **Next step:** Phase 2 Task 2A complete. Ready for Task 2B (Local SQLite Queue and Job Persistence) or next instruction.
 
+## 2026-10-15T13:38:22+05:30 — Phase 2 Task 2B: Folder Watcher, PDF Validation, and Recipient Parsing
+
+- **Phase / task:** Phase 2 / Task 2B — Folder watcher, PDF validation, recipient phone parsing, quarantine handling, and stability checking.
+- **Goal:** Implement the local document ingestion pipeline for the Windows Agent per AGENT_SPEC.md §§ 3–4, SECURITY.md § 5, and RULES.md Rules 2 & 7: watch folder polling with boundary protection, file stability verification, structural PDF validation without external dependencies, E.164 recipient phone parsing with Indian national prefix handling, and safe quarantine isolation with opaque UUID filenames.
+- **Inspection:** Inspected `docs/AGENT_SPEC.md`, `docs/SECURITY.md`, `agent/docflow_agent/config.py`, `agent/docflow_agent/logging.py`, commits `94550d3` and `ed70701`.
+- **Changes:**
+  - `agent/docflow_agent/recipient.py`: Implemented `validate_and_parse_recipient()` and `mask_phone()` enforcing strict E.164 normalization, India (+91) national prefix `0` handling, format cleaning (spaces, hyphens, periods, parentheses), rejection of ambiguous plus signs, unbalanced parentheses, non-PDF extensions, and multiple numbers.
+  - `agent/docflow_agent/stability.py`: Implemented file stability verification sampling size and modification timestamps across intervals to ensure files are fully written by LIS/HIS before ingestion.
+  - `agent/docflow_agent/pdf.py`: Implemented PDF structure and metadata verification (magic bytes `%PDF-`, EOF trailer checks, page count bounds, size limits) without binary parser dependencies.
+  - `agent/docflow_agent/quarantine.py`: Implemented safe quarantine moving corrupt or invalid PDFs into quarantine folder with opaque UUID filenames (`<uuid4>.pdf`), avoiding PII or raw filenames in quarantine storage.
+  - `agent/docflow_agent/watcher.py`: Implemented `FolderWatcher` polling watch directory, boundary protection rejecting directory traversal/reparse points/symlinks outside watch folder, ignoring subdirectories, and coordinating candidate pipeline.
+  - `agent/requirements.txt`: Added watcher and PDF validation dependencies.
+  - `agent/tests/test_recipient.py`, `agent/tests/test_stability.py`, `agent/tests/test_pdf.py`, `agent/tests/test_quarantine.py`, `agent/tests/test_watcher.py`: 60 focused unit and integration tests.
+- **Why:** Safely ingest lab reports without racing with copy operations, leaking patient phone numbers in logs/filenames, processing malicious or malformed PDFs, or following symlinks outside watch boundaries.
+- **Commands run:**
+  - Recorded commits: `94550d3` (`feat(agent): implement folder watcher and PDF validation pipeline (Phase 2 Task 2B)`) and `ed70701` (`fix(agent): enforce watch folder boundaries and fail-closed PDF metadata verification`).
+  - Historical test run: `agent\.venv\Scripts\python -m pytest agent/tests/test_pdf.py agent/tests/test_quarantine.py agent/tests/test_recipient.py agent/tests/test_stability.py agent/tests/test_watcher.py` (60 passed in 0.88s).
+- **Tests/checks:** 60 tests passed across Task 2B suite (10 pdf + 5 quarantine + 21 recipient + 5 stability + 19 watcher).
+- **Security/reliability checks:** Symlinks and directory reparse points pointing outside watch folder rejected; raw patient phone numbers never printed in logs; corrupt PDFs isolated with opaque UUID filenames; stability sampling prevents reading half-written files; source files remain intact upon verification failures.
+- **Decisions:** Pure-Python structural verification for PDFs without binary parser dependencies; assign opaque UUIDs to quarantined files; default region India (+91) with national prefix 0 conversion.
+- **Open issues/blockers:** Local durable SQLite queue and job persistence needed to stage validated reports (Task 2C).
+- **Next step:** Implement Task 2C (SQLite durable queue and deduplication).
+
+## 2026-10-15T14:34:11+05:30 — Phase 2 Task 2C: SQLite Durable Queue and Atomic Migration Fix
+
+- **Phase / task:** Phase 2 / Task 2C — SQLite Durable Queue and Atomic Migration Engine
+- **Goal:** Implement a robust, thread-safe, durable SQLite job queue with deduplication, exclusive worker leases, retry backoff, operator holds, cleanup lifecycle management, and atomic schema migrations per AGENT_SPEC.md §§ 5–6, DATA_MODEL.md § 7, and DELIVERY_STATE_MACHINE.md.
+- Inspection: Inspected `agent/docflow_agent/queue.py`, `agent/tests/test_queue.py`, `docs/AGENT_SPEC.md`, commits `8fde96d` and `62aa5a8`.
+- Changes:
+  - `agent/docflow_agent/queue.py`: Implemented `JobQueue`, `Job`, `JobStatus` lifecycle, schema version tracking via `schema_migrations`, atomic migrations executing each migration within an explicit transaction using `BEGIN IMMEDIATE` write lock, atomic rollback on statement failure, lease claiming with timeout expiration recovery (`claim_next_job`), canonical fingerprint deduplication `sha256("v1|" + branch_id + "|" + recipient_phone_e164 + "|" + content_sha256)`, retry backoff, operator hold suspension/resumption, and agent settings key-value store.
+  - `agent/tests/test_queue.py`: 30 unit tests covering schema migrations, atomicity rollback on partial migration failure, concurrent database initialization, foreign key enforcement, fingerprint deduplication, status transitions, lease acquisition/renewal/expiry, retry delays, and setting storage.
+- Why: Provide reliable local persistence for staged delivery jobs that survives crashes and service restarts, guarantees atomic migrations without partial corruptions, and prevents duplicate report submissions.
+- Commands run:
+  - Recorded commits: `8fde96d` (`feat(agent): implement durable SQLite job queue with deduplication and leases (Phase 2 Task 2C)`) and `62aa5a8` (`fix(agent): make SQLite migrations atomic and safe under concurrency`).
+  - Historical test run: `agent\.venv\Scripts\python -m pytest agent/tests/test_queue.py` (30 passed in 1.97s).
+- Tests/checks: 30 tests passed in `test_queue.py`. Migration atomicity rollback and concurrent initialization verified.
+- Security/reliability checks: Migration statements execute in single transaction; `BEGIN IMMEDIATE` prevents concurrent migration races; PDF bytes and credentials strictly prohibited from SQLite storage (tested); fingerprint uniqueness prevents duplicate submissions.
+- Decisions: SQLite WAL mode and busy timeout of 5000ms; `BEGIN IMMEDIATE` acquired before schema inspection; migration rollback leaves uncorrupted database intact.
+- Open issues/blockers: Authenticated HTTP client needed to communicate with backend APIs (Task 2D-1).
+- Next step: Implement Task 2D-1 (Authenticated HTTP client with origin validation).
+
+## 2026-10-15T15:18:34+05:30 — Phase 2 Task 2D-1: Authenticated HTTP Client and Security Hardening
+
+- **Phase / task:** Phase 2 / Task 2D-1 — Authenticated HTTP Client and Security Hardening Patches
+- **Goal:** Implement the Windows Agent authenticated HTTP client (`ApiClient`) using `httpx`, strictly enforcing trusted origin validation, preventing credential forwarding, sanitizing network logs and exception representations, restricting error codes to known documented safe values, and accepting only documented request-ID formats per API_CONTRACTS.md §§ 1–3 and SECURITY.md § 3.
+- **Inspection:** Inspected `docs/API_CONTRACTS.md`, `agent/docflow_agent/client.py`, `agent/tests/test_client.py`, commits `619b1cb`, `677bcf3`, `4551c5f`, and `8cdce37`.
+- **Changes:**
+  - `agent/docflow_agent/client.py`: Implemented `ApiClient` wrapping `httpx.Client`, origin validation comparing scheme/host/port against configured `base_url`, strict origin check preventing Authorization header injection on external URLs even if `authenticated=False`, network log sanitization logging only HTTP method and fixed event label without caller paths or query params, sanitized error details rejecting raw server strings, error code mapping restricted to documented safe codes (mapping unknown codes to status-based defaults), and request-ID sanitization matching documented formats (`req_[a-zA-Z0-9_-]+` and UUID4) while discarding numeric-only or patient-like identifiers.
+  - `agent/tests/test_client.py`: 97 unit tests covering origin validation, credential protection, log privacy, error code allowlisting, request-ID validation, retry handling, timeouts, and exception privacy.
+- **Why:** Ensure the Windows Agent never leaks bearer tokens to third-party endpoints, never exposes patient PII or secrets through query params in log files, and never exposes arbitrary server-returned strings in exception traces.
+- **Commands run:**
+  - Recorded commits: `619b1cb` (Task 2D-1), `677bcf3` (Task 2D-1a), `4551c5f` (Task 2D-1b), `8cdce37` (Final HTTP privacy fix).
+  - Historical test run: `agent\.venv\Scripts\python -m pytest agent/tests/test_client.py` (97 passed in 9.13s).
+- **Tests/checks:** 97 tests passed. All credential forwarding, log sanitization, error code mapping, and request ID privacy checks passed.
+- **Security/reliability checks:** External URLs never receive Authorization headers; query strings and URL paths never logged; unknown error codes mapped to generic safe codes; request IDs validated against documented pattern; raw backend response details never leaked in exceptions.
+- **Decisions:** `httpx` chosen as HTTP transport; base URL origin strictly enforced; unknown error codes mapped to status default (e.g. `validation_error` for 400); request IDs must match documented regex or UUID format.
+- **Open issues/blockers:** Agent device activation service and secure token storage needed (Task 2D-2).
+- **Next step: Implement Task 2D-2 (Device activation and secure credential storage).
+
+## 2026-10-15T15:33:37+05:30 — Phase 2 Task 2D-2: Agent Device Activation and Secure Token Storage
+
+- **Phase / task:** Phase 2 / Task 2D-2 — Device Activation and Secure Token Storage
+- **Goal:** Implement the Windows Agent initial device activation exchange (`POST /api/v1/agent/activation/exchange`) and secure refresh credential storage using `CredentialStore` per AGENT_SPEC.md § 2, API_CONTRACTS.md § 3, and SECURITY.md § 3.
+- **Inspection:** Inspected `docs/API_CONTRACTS.md` §§ 3 & 5, `docs/AGENT_SPEC.md`, `backend/apps/devices/services.py`, `backend/apps/devices/views.py`, `agent/docflow_agent/credentials.py`, commit `d3212e6`.
+- **Changes:**
+  - `agent/docflow_agent/activation.py`: Created `ActivationService`, `DeviceInfo`, `ActivationResult`, and activation exception hierarchy; implemented one-time code exchange, installation ID management, response payload validation, rotating refresh token persistence to `CredentialStore`, access token retention in memory only, and non-secret device metadata persistence to SQLite settings.
+  - `agent/docflow_agent/cli.py`: Added `activate` subcommand to CLI.
+  - `agent/tests/test_activation.py`: Unit and integration tests covering successful activation, credential storage, error response handling, repeated activation, and secret leakage prevention.
+- **Why:** Allow lab technicians to activate newly installed Windows Agent devices using a one-time activation code generated from the Docflow dashboard.
+- **Commands run:**
+  - Recorded commit: `d3212e6` (`feat(agent): implement device activation and secure token storage (Task 2D-2)`).
+- **Tests/checks:** Initial activation test suite passing.
+- **Security/reliability checks:** Access tokens held in memory only; refresh tokens stored securely in Windows Credential Manager / DPAPI; activation codes never logged or persisted; failed credential storage fails closed without returning tokens.
+- **Decisions:** Refresh token key standardized on `device_refresh_token`; installation ID generated as UUID4 and persisted; access token not written to disk.
+- **Open issues/blockers:** Security gaps identified in activation CLI secrets, status message interpolation, and timestamp validation (Task 2D-2a).
+- **Next step:** Implement Task 2D-2a (Activation security fixes and progress ledger).
+
+## 2026-10-15T15:49:00+05:30 — Phase 2 Task 2D-2a: Activation Security Fixes and Progress Ledger
+
+- **Phase / task:** Phase 2 / Task 2D-2a — Activation Security Hardening and Progress Ledger
+- **Goal:** Correct security gaps in device activation: eliminate command-line activation secrets by removing `--code` and enforcing `getpass.getpass()` with safe failure; sanitize invalid device status error message; enforce documented ISO 8601 UTC timestamp format ending in `Z`; bring progress.md up to date.
+- **Inspection:** Inspected `agent/docflow_agent/cli.py`, `agent/docflow_agent/activation.py`, `agent/tests/test_activation.py`, `progress.md`, git history from `210c7e1` to `d3212e6`.
+- **Changes:**
+  - `agent/docflow_agent/cli.py`: Removed `--code` argument from `activate` subparser; collect activation code exclusively through `getpass.getpass()`; fail safe with exit code 1 and generic error message if secure prompting is unavailable (no fallback to visible `input()`).
+  - `agent/docflow_agent/activation.py`: Replaced raw `raw_status` interpolation with generic safe error message (`"Device status is invalid; expected 'active'."`); added `_parse_utc_iso_timestamp` enforcing ISO 8601 UTC timestamps ending in `Z` and separated by `T`, rejecting naive, non-UTC offset, malformed, or missing timestamps without echoing raw server values.
+  - `agent/tests/test_activation.py`: Added tests for CLI argument rejection (`--code`), getpass collection, secure prompting failure, generic safe device status messages, and comprehensive valid/invalid UTC timestamp categories (71 focused tests).
+  - `progress.md`: Appended entries for Tasks 2B, 2C, 2D-1, 2D-2, and 2D-2a.
+- **Why:** Supplying `--code` on the command line leaks one-time codes to shell history (`.bash_history`, PSReadLine history), process listings, and terminal logs. Echoing raw server status allows injection of unvalidated server strings into exception messages or logs. Naive or non-UTC timestamps violate API_CONTRACTS.md §1 & §3.
+- **Commands run:**
+  - `agent\.venv\Scripts\python -m pytest agent/tests/test_activation.py -v` (71 passed in 1.32s)
+  - `agent\.venv\Scripts\python -m pytest agent/tests -v` (403 passed in 14.44s)
+  - `agent\.venv\Scripts\python -m py_compile agent/docflow_agent/activation.py agent/docflow_agent/cli.py agent/tests/test_activation.py`
+  - `agent\.venv\Scripts\python -c "import sys; sys.path.insert(0, 'agent'); import docflow_agent; from docflow_agent.activation import activate_device; print('OK')"`
+  - `git diff --check`
+- **Tests/checks:**
+  - Focused activation tests: 71 passed, 0 failures.
+  - Full Windows Agent test suite: 403 passed across all 13 test files (6 cli + 51 config + 15 credentials + 22 health + 51 logging + 10 pdf + 5 quarantine + 30 queue + 21 recipient + 5 stability + 19 watcher + 97 client + 71 activation).
+  - Python compilation and module import checks: OK.
+  - `git diff --check`: OK (clean).
+- **Security/reliability checks:** Activation codes cannot be supplied as CLI arguments, printed to stdout/stderr, or logged; secure prompt unavailability fails closed; device status errors sanitized; timestamps strictly validated against ISO 8601 UTC format.
+- **Decisions:** Activation code input must use secure terminal prompting only; invalid status error codes map to `device_not_active` with fixed safe message; ISO 8601 UTC requires `T` separator and `Z` suffix.
+- **Open issues/blockers:** Refresh token rotation (`POST /api/v1/agent/activation/refresh`) and background heartbeat/sync remain to be implemented.
+- **Next step:** Implement refresh-token rotation service and background token refresh lifecycle.
+
 

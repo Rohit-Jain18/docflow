@@ -19,6 +19,7 @@ Covers:
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import copy
 import json
 import logging
 import uuid
@@ -394,6 +395,102 @@ class TestDeviceActivationFailures:
 
         assert not store.exists(REFRESH_TOKEN_KEY)
 
+    def test_invalid_device_status_uses_generic_safe_message_and_does_not_leak(self) -> None:
+        """Invalid device status raises generic safe error message without interpolating raw status."""
+        canary_status = "CANARY_SENSITIVE_STATUS_PATIENT_SSN_12345"
+        payload = copy.deepcopy(VALID_RESPONSE_DATA)
+        payload["device"]["status"] = canary_status
+
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(201, json=payload)
+
+        client = make_mock_client(mock_handler)
+        store = InMemoryCredentialStore()
+        service = ActivationService(client=client, credential_store=store)
+
+        with pytest.raises(ActivationValidationError) as exc_info:
+            service.activate("valid-code")
+
+        err = exc_info.value
+        assert err.code == "device_not_active"
+        assert err.message == "Device status is invalid; expected 'active'."
+        assert canary_status not in str(err)
+        assert canary_status not in repr(err)
+        assert not store.exists(REFRESH_TOKEN_KEY)
+
+    @pytest.mark.parametrize(
+        "field_name",
+        ["access_token_expires_at", "refresh_token_expires_at"],
+    )
+    @pytest.mark.parametrize(
+        "valid_ts",
+        [
+            "2026-10-15T15:30:00Z",
+            "2026-10-15T15:30:00.000Z",
+            "2026-10-15T15:30:00.123456Z",
+        ],
+    )
+    def test_valid_utc_timestamps_accepted(self, field_name: str, valid_ts: str) -> None:
+        """ISO 8601 UTC timestamps ending in 'Z' are accepted."""
+        payload = copy.deepcopy(VALID_RESPONSE_DATA)
+        payload[field_name] = valid_ts
+
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(201, json=payload)
+
+        client = make_mock_client(mock_handler)
+        store = InMemoryCredentialStore()
+        service = ActivationService(client=client, credential_store=store)
+
+        result = service.activate("valid-code")
+        dt_val = getattr(result, field_name)
+        assert dt_val.tzinfo is not None
+        assert dt_val.utcoffset() == timezone.utc.utcoffset(dt_val)
+
+    @pytest.mark.parametrize(
+        "field_name",
+        ["access_token_expires_at", "refresh_token_expires_at"],
+    )
+    @pytest.mark.parametrize(
+        "invalid_ts",
+        [
+            "2026-10-15T15:30:00",  # Naive (no timezone)
+            "2026-10-15T15:30:00+05:30",  # Non-UTC positive offset
+            "2026-10-15T15:30:00-04:00",  # Non-UTC negative offset
+            "2026-10-15T15:30:00+00:00",  # Non-Z UTC offset
+            "2026-10-15 15:30:00Z",  # Space instead of T
+            "2026-10-15T15:30:00z",  # Lowercase z (API_CONTRACTS requires Z)
+            "not-a-timestampZ",  # Malformed
+            "2026-99-99T99:99:99Z",  # Out of range date/time
+            "",  # Empty
+            "   ",  # Whitespace
+            None,  # None
+            1234567890,  # Numeric
+            "CANARY_SENSITIVE_EXPIRY_TOKEN_12345Z",  # Fake sensitive text ending in Z
+        ],
+    )
+    def test_invalid_and_non_utc_timestamps_rejected(self, field_name: str, invalid_ts: Any) -> None:
+        """Naive, non-UTC offset, malformed, missing, and non-Z timestamps are rejected without leaking data."""
+        payload = copy.deepcopy(VALID_RESPONSE_DATA)
+        payload[field_name] = invalid_ts
+
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(201, json=payload)
+
+        client = make_mock_client(mock_handler)
+        store = InMemoryCredentialStore()
+        service = ActivationService(client=client, credential_store=store)
+
+        with pytest.raises(ActivationValidationError) as exc_info:
+            service.activate("valid-code")
+
+        err = exc_info.value
+        assert err.code in ("invalid_timestamp", "missing_timestamp")
+        if isinstance(invalid_ts, str) and invalid_ts.strip():
+            assert invalid_ts not in str(err)
+            assert invalid_ts not in repr(err)
+        assert not store.exists(REFRESH_TOKEN_KEY)
+
     def test_secure_storage_failure_fails_closed(self, tmp_path: Any) -> None:
         """When CredentialStore.store() raises, activation fails closed without returning result."""
         def mock_handler(request: httpx.Request) -> httpx.Response:
@@ -568,13 +665,14 @@ class TestCliActivationCommand:
             h.close()
         logger.handlers.clear()
 
-    def test_cli_activate_success(
+    def test_cli_activate_success_with_getpass(
         self,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
         tmp_path: Any,
     ) -> None:
-        """CLI activate command succeeds and prints only non-sensitive device info."""
+        """CLI activate command succeeds via getpass and prints only non-sensitive device info."""
         def mock_handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(201, json=VALID_RESPONSE_DATA)
 
@@ -586,22 +684,70 @@ class TestCliActivationCommand:
         monkeypatch.setenv("WATCH_FOLDER", str(watch_dir))
         monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "agent.db"))
 
-        # Patch ApiClient in docflow_agent.cli to return our mock client
         monkeypatch.setattr("docflow_agent.cli.ApiClient", lambda **kwargs: mock_client)
+        secret_code = "valid-getpass-code-123"
+        prompt_called = False
 
-        # Run CLI with --code argument
-        exit_code = cli_main(["activate", "--code", "valid-cli-code-123"])
+        def mock_getpass(prompt: str = "") -> str:
+            nonlocal prompt_called
+            prompt_called = True
+            return secret_code
+
+        monkeypatch.setattr("getpass.getpass", mock_getpass)
+
+        with caplog.at_level(logging.DEBUG):
+            exit_code = cli_main(["activate"])
         assert exit_code == 0
+        assert prompt_called is True
 
         captured = capsys.readouterr()
         assert "Device successfully activated." in captured.out
         assert f"Device ID: {VALID_DEVICE_ID}" in captured.out
         assert f"Branch ID: {VALID_BRANCH_ID}" in captured.out
-        # Secrets must never be printed to stdout or stderr
-        assert "valid-cli-code-123" not in captured.out
+        # Secrets must never be printed to stdout, stderr, or logs
+        assert secret_code not in captured.out
         assert "rotating-secret" not in captured.out
         assert "signed.access.token" not in captured.out
-        assert "valid-cli-code-123" not in captured.err
+        assert secret_code not in captured.err
+        assert secret_code not in caplog.text
+        assert "rotating-secret" not in caplog.text
+        assert "signed.access.token" not in caplog.text
+
+    def test_cli_activate_rejects_code_flag_as_unrecognized_argument(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """--code flag is removed and rejected by CLI parser as unrecognized argument."""
+        with pytest.raises(SystemExit) as exc_info:
+            cli_main(["activate", "--code", "secret-cli-argument-code"])
+
+        # argparse exits with code 2 on unrecognized arguments
+        assert exc_info.value.code != 0
+
+        captured = capsys.readouterr()
+        assert "unrecognized arguments: --code" in captured.err or "--code" in captured.err
+        assert "secret-cli-argument-code" not in captured.out
+
+    def test_cli_activate_secure_prompting_unavailable_fails_safe(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """When getpass fails, the CLI fails with a safe message instead of falling back to input()."""
+        def broken_getpass(prompt: str = "") -> str:
+            raise OSError("Inappropriate ioctl for device")
+
+        def forbidden_input(prompt: str = "") -> str:
+            raise AssertionError("input() must NEVER be called when getpass fails!")
+
+        monkeypatch.setattr("getpass.getpass", broken_getpass)
+        monkeypatch.setattr("builtins.input", forbidden_input)
+
+        exit_code = cli_main(["activate"])
+        assert exit_code == 1
+
+        captured = capsys.readouterr()
+        assert "Error: Secure prompting is unavailable. Cannot prompt for activation code." in captured.err
 
     def test_cli_activate_empty_code_fails(
         self,
@@ -609,8 +755,7 @@ class TestCliActivationCommand:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         """CLI activate command with empty code fails with exit code 1."""
-        # Simulate user pressing Enter without entering a code
-        monkeypatch.setattr("getpass.getpass", lambda prompt: "")
+        monkeypatch.setattr("getpass.getpass", lambda prompt="": "")
         exit_code = cli_main(["activate"])
         assert exit_code == 1
 
@@ -621,9 +766,10 @@ class TestCliActivationCommand:
         self,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
         tmp_path: Any,
     ) -> None:
-        """CLI activate command prints safe error message on backend failure."""
+        """CLI activate command prints safe error message on backend failure without leaking secrets."""
         def mock_handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(410, json={"code": "activation_expired", "detail": "Code expired."})
 
@@ -636,10 +782,15 @@ class TestCliActivationCommand:
         monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "agent.db"))
         monkeypatch.setattr("docflow_agent.cli.ApiClient", lambda **kwargs: mock_client)
 
-        exit_code = cli_main(["activate", "--code", "expired-code"])
+        secret_expired_code = "CANARY_EXPIRED_CODE_778899"
+        monkeypatch.setattr("getpass.getpass", lambda prompt="": secret_expired_code)
+
+        with caplog.at_level(logging.DEBUG):
+            exit_code = cli_main(["activate"])
         assert exit_code == 1
 
         captured = capsys.readouterr()
         assert "Activation failed: activation_expired" in captured.err
-        assert "expired-code" not in captured.err
-        assert "expired-code" not in captured.out
+        assert secret_expired_code not in captured.err
+        assert secret_expired_code not in captured.out
+        assert secret_expired_code not in caplog.text
