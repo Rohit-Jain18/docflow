@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import re
 import urllib.parse
 from collections.abc import Callable
 from typing import Any
@@ -38,6 +39,107 @@ DEFAULT_TIMEOUT = httpx.Timeout(
 
 # Type alias for token provider function
 TokenProvider = Callable[[], str | None]
+
+# ---------------------------------------------------------------------------
+# Security and Sanitization Helpers (Task 2D-1a)
+# ---------------------------------------------------------------------------
+
+SAFE_CODE_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+SAFE_REQUEST_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+SAFE_FIELD_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+SAFE_FIELD_ERROR_TOKENS: frozenset[str] = frozenset({
+    "invalid",
+    "required",
+    "null",
+    "blank",
+    "unique",
+    "max_length",
+    "min_length",
+    "invalid_choice",
+    "invalid_format",
+    "not_found",
+    "already_exists",
+})
+
+GENERIC_SAFE_DETAILS: dict[int, str] = {
+    400: "Request failed validation or was malformed.",
+    401: "Authentication is required or credentials are missing/invalid.",
+    403: "Permission denied for this operation.",
+    404: "The requested resource was not found.",
+    409: "Resource conflict or idempotency conflict occurred.",
+    429: "Rate limit exceeded. Please back off.",
+}
+
+
+def _is_authorization_header(key: Any) -> bool:
+    """Check if header key represents an Authorization header case-insensitively."""
+    if isinstance(key, bytes):
+        try:
+            key = key.decode("utf-8", errors="ignore")
+        except Exception:
+            return False
+    return str(key).strip().lower() == "authorization"
+
+
+def _get_generic_detail(status_code: int) -> str:
+    """Return a generic safe detail message for an HTTP status code."""
+    if status_code in GENERIC_SAFE_DETAILS:
+        return GENERIC_SAFE_DETAILS[status_code]
+    if 500 <= status_code <= 599:
+        return "Docflow server encountered an internal error."
+    return f"Docflow server returned HTTP {status_code} error."
+
+
+def _sanitize_error_code(raw_code: Any, default: str) -> str:
+    """Validate and bound error code to safe alphanumeric/snake_case tokens."""
+    if isinstance(raw_code, str):
+        cleaned = raw_code.strip()
+        if SAFE_CODE_PATTERN.fullmatch(cleaned):
+            return cleaned.lower()
+    return default
+
+
+def _sanitize_request_id(raw_id: Any) -> str | None:
+    """Validate and bound request ID to safe alphanumeric tokens."""
+    if isinstance(raw_id, str):
+        cleaned = raw_id.strip()
+        if SAFE_REQUEST_ID_PATTERN.fullmatch(cleaned):
+            return cleaned
+    return None
+
+
+def _sanitize_field_errors(raw_field_errors: Any) -> dict[str, list[str]]:
+    """Sanitize structured field errors so arbitrary strings or PII cannot leak."""
+    if not isinstance(raw_field_errors, dict):
+        return {}
+
+    sanitized: dict[str, list[str]] = {}
+    for raw_key, raw_val in raw_field_errors.items():
+        if not isinstance(raw_key, str) or not SAFE_FIELD_NAME_PATTERN.fullmatch(raw_key.strip()):
+            continue
+        field_name = raw_key.strip()
+
+        tokens: list[str] = []
+        if isinstance(raw_val, (list, tuple)):
+            for item in raw_val:
+                item_str = str(item).strip().lower() if item is not None else ""
+                if item_str in SAFE_FIELD_ERROR_TOKENS:
+                    tokens.append(item_str)
+                else:
+                    tokens.append("invalid")
+        elif isinstance(raw_val, str):
+            item_str = raw_val.strip().lower()
+            if item_str in SAFE_FIELD_ERROR_TOKENS:
+                tokens.append(item_str)
+            else:
+                tokens.append("invalid")
+        else:
+            tokens.append("invalid")
+
+        sanitized[field_name] = tokens or ["invalid"]
+
+    return sanitized
 
 
 # ---------------------------------------------------------------------------
@@ -75,16 +177,22 @@ class ApiResponseError(ApiClientError):
         request_id: str | None = None,
         field_errors: dict[str, Any] | None = None,
     ) -> None:
-        self.status_code = status_code
-        self.code = code or "http_error"
-        self.detail = detail or f"HTTP {status_code} error"
-        self.request_id = request_id
-        self.field_errors = field_errors or {}
+        self.status_code = int(status_code)
+        self.code = _sanitize_error_code(code, default="http_error")
+        self.detail = detail or _get_generic_detail(self.status_code)
+        self.request_id = _sanitize_request_id(request_id)
+        self.field_errors = _sanitize_field_errors(field_errors)
 
-        msg = f"HTTP {status_code} ({self.code}): {self.detail}"
-        if request_id:
-            msg += f" [request_id={request_id}]"
+        msg = f"HTTP {self.status_code} ({self.code}): {self.detail}"
+        if self.request_id:
+            msg += f" [request_id={self.request_id}]"
         super().__init__(msg)
+
+    def __repr__(self) -> str:
+        parts = [f"status_code={self.status_code}", f"code={self.code!r}"]
+        if self.request_id:
+            parts.append(f"request_id={self.request_id!r}")
+        return f"{self.__class__.__name__}({', '.join(parts)})"
 
 
 class ApiAuthenticationError(ApiResponseError):
@@ -94,14 +202,14 @@ class ApiAuthenticationError(ApiResponseError):
         self,
         status_code: int = 401,
         code: str | None = "authentication_required",
-        detail: str | None = "Authentication is required or credentials are missing/invalid.",
+        detail: str | None = None,
         request_id: str | None = None,
         field_errors: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(
             status_code=status_code,
-            code=code,
-            detail=detail,
+            code=code or "authentication_required",
+            detail=detail or _get_generic_detail(401),
             request_id=request_id,
             field_errors=field_errors,
         )
@@ -114,14 +222,14 @@ class ApiPermissionError(ApiResponseError):
         self,
         status_code: int = 403,
         code: str | None = "permission_denied",
-        detail: str | None = "Permission denied for this operation.",
+        detail: str | None = None,
         request_id: str | None = None,
         field_errors: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(
             status_code=status_code,
-            code=code,
-            detail=detail,
+            code=code or "permission_denied",
+            detail=detail or _get_generic_detail(403),
             request_id=request_id,
             field_errors=field_errors,
         )
@@ -134,14 +242,14 @@ class ApiNotFoundError(ApiResponseError):
         self,
         status_code: int = 404,
         code: str | None = "not_found",
-        detail: str | None = "The requested resource was not found.",
+        detail: str | None = None,
         request_id: str | None = None,
         field_errors: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(
             status_code=status_code,
-            code=code,
-            detail=detail,
+            code=code or "not_found",
+            detail=detail or _get_generic_detail(404),
             request_id=request_id,
             field_errors=field_errors,
         )
@@ -154,14 +262,14 @@ class ApiConflictError(ApiResponseError):
         self,
         status_code: int = 409,
         code: str | None = "conflict",
-        detail: str | None = "Resource conflict or idempotency conflict occurred.",
+        detail: str | None = None,
         request_id: str | None = None,
         field_errors: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(
             status_code=status_code,
-            code=code,
-            detail=detail,
+            code=code or "conflict",
+            detail=detail or _get_generic_detail(409),
             request_id=request_id,
             field_errors=field_errors,
         )
@@ -174,7 +282,7 @@ class ApiRateLimitError(ApiResponseError):
         self,
         status_code: int = 429,
         code: str | None = "rate_limited",
-        detail: str | None = "Rate limit exceeded. Please back off.",
+        detail: str | None = None,
         request_id: str | None = None,
         retry_after: float | None = None,
         field_errors: dict[str, Any] | None = None,
@@ -182,11 +290,19 @@ class ApiRateLimitError(ApiResponseError):
         self.retry_after = retry_after
         super().__init__(
             status_code=status_code,
-            code=code,
-            detail=detail,
+            code=code or "rate_limited",
+            detail=detail or _get_generic_detail(429),
             request_id=request_id,
             field_errors=field_errors,
         )
+
+    def __repr__(self) -> str:
+        parts = [f"status_code={self.status_code}", f"code={self.code!r}"]
+        if self.request_id:
+            parts.append(f"request_id={self.request_id!r}")
+        if self.retry_after is not None:
+            parts.append(f"retry_after={self.retry_after!r}")
+        return f"{self.__class__.__name__}({', '.join(parts)})"
 
 
 # ---------------------------------------------------------------------------
@@ -266,11 +382,11 @@ class ApiClient:
 
     def _resolve_url(self, path_or_url: str) -> str:
         """Resolve a path or URL, ensuring no query/userinfo injection on relative paths."""
-        if not path_or_url.startswith(("http://", "https://")):
-            # Relative path
-            cleaned = path_or_url.lstrip("/")
-            return f"{self.base_url}/{cleaned}"
-        return path_or_url
+        parsed = urllib.parse.urlsplit(path_or_url)
+        if parsed.scheme.lower() in ("http", "https"):
+            return path_or_url
+        cleaned = path_or_url.lstrip("/")
+        return f"{self.base_url}/{cleaned}"
 
     def request(
         self,
@@ -298,17 +414,26 @@ class ApiClient:
         target_url = self._resolve_url(path)
         is_trusted = self.is_trusted_origin(target_url)
 
+        # Detect caller-supplied Authorization header (case-insensitive)
+        has_caller_auth = bool(headers) and any(
+            _is_authorization_header(k) for k in headers
+        )
+
+        # Security (Task 2D-1a Requirement 1): Never send an Authorization header to an origin
+        # other than the configured trusted API origin, regardless of authenticated=True/False.
+        # Prevent callers from bypassing origin validation by supplying their own Authorization header.
+        # Reject unsafe requests before making any network call.
+        if (authenticated or has_caller_auth) and not is_trusted:
+            raise UntrustedOriginError(
+                "Refusing to send credentials or authorization headers to untrusted origin."
+            )
+
         req_headers = dict(self._default_headers)
         if headers:
             req_headers.update(headers)
 
         # Handle authentication
         if authenticated:
-            if not is_trusted:
-                raise UntrustedOriginError(
-                    "Refusing to send authenticated request to untrusted origin."
-                )
-
             if self.token_provider is None:
                 raise ApiAuthenticationError(
                     status_code=401,
@@ -324,6 +449,11 @@ class ApiClient:
                     detail="No access token available for authenticated request.",
                 )
 
+            # Strip any manual authorization headers to prevent duplicate/conflicting headers
+            for k in list(req_headers.keys()):
+                if _is_authorization_header(k):
+                    del req_headers[k]
+
             req_headers["Authorization"] = f"Bearer {str(token).strip()}"
 
         try:
@@ -335,14 +465,15 @@ class ApiClient:
                 headers=req_headers,
             )
         except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as exc:
-            # Predictable, sanitized timeout exception without echoing headers or raw URL query/userinfo
-            logger.warning("API request timed out (%s %s): %s", method.upper(), path, type(exc).__name__)
+            # Security (Task 2D-1a Requirement 2): Never log caller-supplied path or full URL.
+            # Log only safe metadata: HTTP method, fixed event label, and exception type.
+            logger.warning("API request timed out (%s): %s", method.upper(), type(exc).__name__)
             raise ApiTimeoutError(f"API request timed out: {type(exc).__name__}") from None
         except (httpx.ConnectError, httpx.NetworkError) as exc:
-            logger.warning("API connection failed (%s %s): %s", method.upper(), path, type(exc).__name__)
+            logger.warning("API connection failed (%s): %s", method.upper(), type(exc).__name__)
             raise ApiConnectionError(f"API connection failed: {type(exc).__name__}") from None
         except httpx.RequestError as exc:
-            logger.warning("API request error (%s %s): %s", method.upper(), path, type(exc).__name__)
+            logger.warning("API request error (%s): %s", method.upper(), type(exc).__name__)
             raise ApiConnectionError(f"API request error: {type(exc).__name__}") from None
 
         # Handle HTTP error responses
@@ -361,77 +492,91 @@ class ApiClient:
             ) from None
 
     def _handle_error_response(self, response: httpx.Response) -> None:
-        """Parse structured error from Django API if available and raise typed exception."""
+        """Parse structured error from Django API if available and raise typed exception.
+
+        Security (Task 2D-1a Requirement 3):
+        - Do not copy raw server response details or arbitrary field-error values into
+          exception messages, representations, or logs.
+        - Keep safe, useful metadata: HTTP status, validated bounded error code, and request ID.
+        - Use generic safe details for exceptions.
+        - Structured field errors values are sanitized to generic safe tokens.
+        - Do not log response bodies.
+        """
         status = response.status_code
         request_id = response.headers.get("x-request-id")
-        code: str | None = None
-        detail: str | None = None
-        field_errors: dict[str, Any] | None = None
+        raw_code: Any = None
+        raw_field_errors: Any = None
 
         with contextlib.suppress(Exception):
             payload = response.json()
             if isinstance(payload, dict):
-                code = payload.get("code") or payload.get("error", {}).get("code")
-                detail = (
-                    payload.get("detail")
-                    or payload.get("message")
-                    or payload.get("error", {}).get("message")
-                )
+                raw_code = payload.get("code") or payload.get("error", {}).get("code")
                 request_id = request_id or payload.get("request_id")
-                field_errors = payload.get("field_errors")
+                raw_field_errors = payload.get("field_errors")
+
+        safe_detail = _get_generic_detail(status)
+        safe_req_id = _sanitize_request_id(request_id)
+        sanitized_fields = _sanitize_field_errors(raw_field_errors)
 
         if status == 401:
+            safe_code = _sanitize_error_code(raw_code, default="authentication_required")
             raise ApiAuthenticationError(
                 status_code=401,
-                code=code or "authentication_required",
-                detail=detail,
-                request_id=request_id,
-                field_errors=field_errors,
+                code=safe_code,
+                detail=safe_detail,
+                request_id=safe_req_id,
+                field_errors=sanitized_fields,
             )
         if status == 403:
+            safe_code = _sanitize_error_code(raw_code, default="permission_denied")
             raise ApiPermissionError(
                 status_code=403,
-                code=code or "permission_denied",
-                detail=detail,
-                request_id=request_id,
-                field_errors=field_errors,
+                code=safe_code,
+                detail=safe_detail,
+                request_id=safe_req_id,
+                field_errors=sanitized_fields,
             )
         if status == 404:
+            safe_code = _sanitize_error_code(raw_code, default="not_found")
             raise ApiNotFoundError(
                 status_code=404,
-                code=code or "not_found",
-                detail=detail,
-                request_id=request_id,
-                field_errors=field_errors,
+                code=safe_code,
+                detail=safe_detail,
+                request_id=safe_req_id,
+                field_errors=sanitized_fields,
             )
         if status == 409:
+            safe_code = _sanitize_error_code(raw_code, default="conflict")
             raise ApiConflictError(
                 status_code=409,
-                code=code or "conflict",
-                detail=detail,
-                request_id=request_id,
-                field_errors=field_errors,
+                code=safe_code,
+                detail=safe_detail,
+                request_id=safe_req_id,
+                field_errors=sanitized_fields,
             )
         if status == 429:
+            safe_code = _sanitize_error_code(raw_code, default="rate_limited")
             retry_after: float | None = None
             if "retry-after" in response.headers:
                 with contextlib.suppress(ValueError):
                     retry_after = float(response.headers["retry-after"])
             raise ApiRateLimitError(
                 status_code=429,
-                code=code or "rate_limited",
-                detail=detail,
-                request_id=request_id,
+                code=safe_code,
+                detail=safe_detail,
+                request_id=safe_req_id,
                 retry_after=retry_after,
-                field_errors=field_errors,
+                field_errors=sanitized_fields,
             )
 
+        default_code = "validation_error" if status == 400 else "server_error" if status >= 500 else "http_error"
+        safe_code = _sanitize_error_code(raw_code, default=default_code)
         raise ApiResponseError(
             status_code=status,
-            code=code or "http_error",
-            detail=detail or f"Server returned error HTTP {status}",
-            request_id=request_id,
-            field_errors=field_errors,
+            code=safe_code,
+            detail=safe_detail,
+            request_id=safe_req_id,
+            field_errors=sanitized_fields,
         )
 
     # Convenience HTTP methods

@@ -208,6 +208,137 @@ class TestAuthenticatedRequests:
         finally:
             client.close()
 
+    def test_manual_auth_header_with_unauthenticated_external_url_rejected(self) -> None:
+        """Callers must not bypass origin validation by supplying manual Authorization headers with authenticated=False."""
+        network_called = False
+
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            nonlocal network_called
+            network_called = True
+            return httpx.Response(status_code=200, json={"status": "ok"})
+
+        mock_http_client = httpx.Client(
+            base_url="https://api.docflow.example.com",
+            transport=httpx.MockTransport(mock_handler),
+        )
+        client = ApiClient(
+            base_url="https://api.docflow.example.com",
+            http_client=mock_http_client,
+        )
+        try:
+            # Rejects unsafe request before making any network call
+            with pytest.raises(UntrustedOriginError):
+                client.get(
+                    "https://evil.example.com/steal",
+                    headers={"Authorization": "Bearer leaked_manual_token_123"},
+                    authenticated=False,
+                )
+            assert network_called is False
+        finally:
+            client.close()
+
+    @pytest.mark.parametrize(
+        "header_key",
+        ["Authorization", "authorization", "AUTHORIZATION", " Authorization "],
+    )
+    def test_manual_auth_header_case_insensitive_variants_rejected(self, header_key: str) -> None:
+        """All casing variants of Authorization header must be rejected for external origins."""
+        client = ApiClient("https://api.docflow.example.com")
+        try:
+            with pytest.raises(UntrustedOriginError):
+                client.post(
+                    "https://evil.example.com/leak",
+                    headers={header_key: "Bearer secret_token"},
+                    authenticated=False,
+                )
+        finally:
+            client.close()
+
+    def test_manual_auth_header_different_port_rejected(self) -> None:
+        """Targeting a different port on the same host with credentials must be rejected."""
+        client = ApiClient("https://api.docflow.example.com:8443")
+        try:
+            with pytest.raises(UntrustedOriginError):
+                client.get(
+                    "https://api.docflow.example.com:443/api/v1/config",
+                    headers={"Authorization": "Bearer secret_token"},
+                    authenticated=False,
+                )
+        finally:
+            client.close()
+
+    def test_manual_auth_header_different_scheme_rejected(self) -> None:
+        """Targeting an insecure scheme (http vs https) with credentials must be rejected."""
+        client = ApiClient("https://api.docflow.example.com")
+        try:
+            with pytest.raises(UntrustedOriginError):
+                client.get(
+                    "http://api.docflow.example.com/api/v1/config",
+                    headers={"Authorization": "Bearer secret_token"},
+                    authenticated=False,
+                )
+        finally:
+            client.close()
+
+    def test_manual_auth_header_to_trusted_origin_allowed(self) -> None:
+        """Manual Authorization headers to the trusted origin with authenticated=False are permitted."""
+        captured_request: httpx.Request | None = None
+
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            nonlocal captured_request
+            captured_request = request
+            return httpx.Response(status_code=200, json={"status": "ok"})
+
+        mock_http_client = httpx.Client(
+            base_url="https://api.docflow.example.com",
+            transport=httpx.MockTransport(mock_handler),
+        )
+        client = ApiClient(
+            base_url="https://api.docflow.example.com",
+            http_client=mock_http_client,
+        )
+        try:
+            resp = client.get(
+                "/api/v1/agent/config",
+                headers={"Authorization": "Bearer custom_manual_token"},
+                authenticated=False,
+            )
+            assert resp == {"status": "ok"}
+            assert captured_request is not None
+            assert captured_request.headers["Authorization"] == "Bearer custom_manual_token"
+        finally:
+            client.close()
+
+    def test_authenticated_request_overrides_caller_manual_auth_header(self) -> None:
+        """When authenticated=True, the client's token provider is always authoritative."""
+        captured_request: httpx.Request | None = None
+
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            nonlocal captured_request
+            captured_request = request
+            return httpx.Response(status_code=200, json={"status": "ok"})
+
+        mock_http_client = httpx.Client(
+            base_url="https://api.docflow.example.com",
+            transport=httpx.MockTransport(mock_handler),
+        )
+        client = ApiClient(
+            base_url="https://api.docflow.example.com",
+            token_provider=lambda: "authoritative_provider_token",
+            http_client=mock_http_client,
+        )
+        try:
+            resp = client.get(
+                "/api/v1/agent/config",
+                headers={"authorization": "Bearer bogus_override_attempt"},
+                authenticated=True,
+            )
+            assert resp == {"status": "ok"}
+            assert captured_request is not None
+            assert captured_request.headers["Authorization"] == "Bearer authoritative_provider_token"
+        finally:
+            client.close()
+
 
 class TestErrorAndTimeoutHandling:
     """Tests for connection failures, timeouts, HTTP status errors, and malformed responses."""
@@ -279,9 +410,11 @@ class TestErrorAndTimeoutHandling:
         err = exc_info.value
         assert err.status_code == 400
         assert err.code == "validation_error"
-        assert "One or more fields are invalid." in err.detail
+        # Generic safe detail is returned, raw server string is not copied
+        assert "Request failed validation" in err.detail
         assert err.request_id == "req-12345"
         assert "content_sha256" in err.field_errors
+        assert err.field_errors["content_sha256"] == ["invalid"]
 
     def test_http_401_raises_api_authentication_error(self) -> None:
         def mock_handler(request: httpx.Request) -> httpx.Response:
@@ -470,3 +603,192 @@ class TestLogAndExceptionSanitization:
             assert secret_token not in msg
             assert "Authorization" not in msg
             assert "sensitive_bearer_token" not in msg
+
+    def test_path_with_secret_query_string_not_exposed_in_logs_or_timeout_exception(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Requirement 2: Caller-supplied path or query parameters with secrets must never appear in logs or exceptions."""
+        fake_secret = "super_secret_query_token_ABC987"
+        fake_patient = "patient_id_MRN12345"
+        sensitive_path = f"/api/v1/patient-records?token={fake_secret}&patient={fake_patient}"
+
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("Operation timed out")
+
+        client = ApiClient(
+            base_url="https://api.docflow.example.com",
+            http_client=httpx.Client(
+                base_url="https://api.docflow.example.com",
+                transport=httpx.MockTransport(mock_handler),
+            ),
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(ApiTimeoutError) as exc_info:
+                client.get(sensitive_path, authenticated=False)
+
+        # Verify exception string and repr do not leak secret or query params
+        assert fake_secret not in str(exc_info.value)
+        assert fake_secret not in repr(exc_info.value)
+        assert fake_patient not in str(exc_info.value)
+        assert fake_patient not in repr(exc_info.value)
+        assert "?token=" not in str(exc_info.value)
+
+        # Verify logs only contain safe metadata (HTTP method, fixed label, exception type)
+        assert len(caplog.records) > 0
+        for record in caplog.records:
+            msg = record.getMessage()
+            assert fake_secret not in msg
+            assert fake_patient not in msg
+            assert "?token=" not in msg
+            assert "/api/v1/patient-records" not in msg
+            assert "API request timed out (GET): ReadTimeout" in msg
+
+    def test_path_with_secret_query_string_not_exposed_in_connection_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Requirement 2: Connection failure logs must not expose caller-supplied path or query parameters."""
+        fake_secret = "secret_connection_token_XYZ555"
+        sensitive_path = f"/api/v1/upload?auth_key={fake_secret}"
+
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("Failed to connect")
+
+        client = ApiClient(
+            base_url="https://api.docflow.example.com",
+            http_client=httpx.Client(
+                base_url="https://api.docflow.example.com",
+                transport=httpx.MockTransport(mock_handler),
+            ),
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(ApiConnectionError) as exc_info:
+                client.post(sensitive_path, json={}, authenticated=False)
+
+        assert fake_secret not in str(exc_info.value)
+        assert fake_secret not in repr(exc_info.value)
+
+        assert len(caplog.records) > 0
+        for record in caplog.records:
+            msg = record.getMessage()
+            assert fake_secret not in msg
+            assert "?auth_key=" not in msg
+            assert "/api/v1/upload" not in msg
+            assert "API connection failed (POST): ConnectError" in msg
+
+    def test_server_error_response_does_not_leak_bearer_tokens_or_patient_data(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Requirement 3: Error responses containing fake bearer tokens and sensitive patient data
+        must be completely sanitized from exception messages, representations, and logs."""
+        fake_bearer_token = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.sensitive_fake_jwt_token_999888"
+        fake_patient_data = "Patient John Doe MRN-554433 SSN-000-11-2222 Diagnosis: Acute Pancreatitis"
+
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                status_code=400,
+                headers={"X-Request-ID": "req-safe-12345"},
+                json={
+                    "code": "validation_error",
+                    "detail": f"Processing failed for {fake_patient_data} with credentials {fake_bearer_token}",
+                    "message": f"Internal database error with {fake_patient_data}",
+                    "error": {
+                        "code": "validation_error",
+                        "message": f"Error context: {fake_bearer_token}",
+                    },
+                    "field_errors": {
+                        "patient_name": [f"Invalid patient name: {fake_patient_data}"],
+                        "authorization": [f"Invalid header value: {fake_bearer_token}"],
+                        "status": ["invalid"],
+                    },
+                },
+            )
+
+        client = ApiClient(
+            base_url="https://api.docflow.example.com",
+            http_client=httpx.Client(
+                base_url="https://api.docflow.example.com",
+                transport=httpx.MockTransport(mock_handler),
+            ),
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(ApiResponseError) as exc_info:
+                client.post("/api/v1/reports", json={}, authenticated=False)
+
+        err = exc_info.value
+        err_str = str(err)
+        err_repr = repr(err)
+
+        # 1. Verify fake bearer token is completely absent
+        assert fake_bearer_token not in err_str
+        assert fake_bearer_token not in err_repr
+        assert fake_bearer_token not in err.detail
+        assert fake_bearer_token not in str(err.field_errors)
+        assert "sensitive_fake_jwt" not in err_str
+        assert "sensitive_fake_jwt" not in err_repr
+
+        # 2. Verify sensitive patient data is completely absent
+        assert fake_patient_data not in err_str
+        assert fake_patient_data not in err_repr
+        assert fake_patient_data not in err.detail
+        assert fake_patient_data not in str(err.field_errors)
+        assert "John Doe" not in err_str
+        assert "John Doe" not in err_repr
+        assert "John Doe" not in str(err.field_errors)
+        assert "Pancreatitis" not in err_str
+        assert "MRN-554433" not in err_str
+
+        # 3. Verify safe metadata is preserved and structured field errors are sanitized
+        assert err.status_code == 400
+        assert err.code == "validation_error"
+        assert err.request_id == "req-safe-12345"
+        assert err.detail == "Request failed validation or was malformed."
+        assert err.field_errors["patient_name"] == ["invalid"]
+        assert err.field_errors["authorization"] == ["invalid"]
+        assert err.field_errors["status"] == ["invalid"]
+
+        # 4. Verify no response bodies were logged
+        for record in caplog.records:
+            msg = record.getMessage()
+            assert fake_bearer_token not in msg
+            assert fake_patient_data not in msg
+            assert "John Doe" not in msg
+
+    def test_server_error_with_malicious_code_and_request_id_sanitized(self) -> None:
+        """Requirement 3: Arbitrary or malicious code and request_id values containing secrets are bounded and sanitized."""
+        fake_secret = "secret_injected_code_XYZ"
+        fake_patient = "patient_injected_id_999"
+
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                status_code=500,
+                headers={"X-Request-ID": f"req-{fake_secret}-{fake_patient}-WITH-SPACES-AND-PII"},
+                json={
+                    "code": f"code with spaces and {fake_secret} and {fake_patient}",
+                    "detail": f"Leak {fake_secret}",
+                },
+            )
+
+        client = ApiClient(
+            base_url="https://api.docflow.example.com",
+            http_client=httpx.Client(
+                base_url="https://api.docflow.example.com",
+                transport=httpx.MockTransport(mock_handler),
+            ),
+        )
+
+        with pytest.raises(ApiResponseError) as exc_info:
+            client.get("/api/v1/status", authenticated=False)
+
+        err = exc_info.value
+        # Validated bounded fallback code is used
+        assert err.code == "server_error"
+        assert err.status_code == 500
+        # Malformed request_id with spaces and secrets is rejected to None
+        assert err.request_id is None
+        assert fake_secret not in str(err)
+        assert fake_secret not in repr(err)
+        assert fake_patient not in str(err)
+        assert fake_patient not in repr(err)
