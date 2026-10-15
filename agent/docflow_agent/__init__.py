@@ -68,7 +68,12 @@ from docflow_agent.retention import (
     verify_cleanup_checklist,
 )
 from docflow_agent.runtime import AgentRuntime, calculate_backoff_delay
-from docflow_agent.service import DocflowAgentService, ServiceRunner, handle_service_command
+from docflow_agent.service import (
+    DocflowAgentService,
+    ServiceRunner,
+    handle_service_command,
+    start_service_dispatcher,
+)
 from docflow_agent.stability import StabilityResult, check_stability
 from docflow_agent.sync import (
     ConfigSyncService,
@@ -144,6 +149,7 @@ __all__ = [
     "ServiceRunner",
     "SourceFileUnavailableError",
     "handle_service_command",
+    "start_service_dispatcher",
 
     "StabilityResult",
     "TokenAuthenticationError",

@@ -93,6 +93,11 @@ def _cmd_activate(args: argparse.Namespace) -> int:
 
 def _cmd_run(args: argparse.Namespace) -> int:
     """Run the agent worker runtime."""
+    if getattr(args, "service", False):
+        from docflow_agent.service import start_service_dispatcher
+
+        return start_service_dispatcher()
+
     from docflow_agent.config import load_config
     from docflow_agent.runtime import AgentRuntime
     from docflow_agent.service import ServiceRunner
@@ -140,9 +145,23 @@ def main(argv: list[str] | None = None) -> int:
     Returns:
         Exit code (0 = success, 1 = failure).
     """
+    # Check if Windows SCM launched this process as a Windows Service
+    try:
+        from docflow_agent.service import HAS_WIN32_SERVICE, servicemanager, start_service_dispatcher
+
+        if HAS_WIN32_SERVICE and servicemanager and servicemanager.RunningAsService():
+            return start_service_dispatcher()
+    except Exception as exc:
+        logger.debug("Failed checking RunningAsService: %s", exc)
+
     parser = argparse.ArgumentParser(
         prog="docflow-agent",
         description="Docflow Windows Agent CLI",
+    )
+    parser.add_argument(
+        "--service",
+        action="store_true",
+        help="Run under Windows Service Control Manager",
     )
     subparsers = parser.add_subparsers(dest="command")
 
@@ -184,6 +203,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Perform a single sweep and exit.",
     )
+    run_parser.add_argument(
+        "--service",
+        action="store_true",
+        help="Run under Windows Service Control Manager",
+    )
     run_parser.set_defaults(func=_cmd_run)
 
     # service
@@ -206,6 +230,11 @@ def main(argv: list[str] | None = None) -> int:
 
 
     args = parser.parse_args(argv)
+
+    if getattr(args, "service", False):
+        from docflow_agent.service import start_service_dispatcher
+
+        return start_service_dispatcher()
 
     if not hasattr(args, "func"):
         parser.print_help()

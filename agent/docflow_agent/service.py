@@ -175,6 +175,8 @@ class DocflowAgentService(BaseServiceClass):
     _svc_description_ = (
         "Docflow Windows Agent: automated diagnostic report folder monitoring and metadata registration."
     )
+    _exe_args_ = "--service"
+
 
     def __init__(self, args: Any = None) -> None:
         if HAS_WIN32_SERVICE and BaseServiceClass is not object:
@@ -277,4 +279,23 @@ def handle_service_command(argv: list[str] | None = None) -> int:
         return int(exc.winerror) if exc.winerror else 1
     except Exception as exc:
         print(f"Windows Service management failed: {exc}", file=sys.stderr)
+        return 1
+
+
+def start_service_dispatcher() -> int:
+    """Connect to Windows Service Control Manager and dispatch service lifecycle callbacks."""
+    if not HAS_WIN32_SERVICE or servicemanager is None:
+        logger.error("Cannot start service dispatcher: pywin32 is unavailable.")
+        return 1
+
+    try:
+        servicemanager.Initialize()
+        servicemanager.PrepareToHostSingle(DocflowAgentService)
+        servicemanager.StartServiceCtrlDispatcher()
+        return 0
+    except pywintypes.error as exc:
+        logger.error("Service dispatcher failed to connect to Windows SCM: %s", exc)
+        return int(exc.winerror) if exc.winerror else 1
+    except Exception as exc:
+        logger.error("Service dispatcher failed: %s", exc)
         return 1

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pathlib
 import sys
 from unittest.mock import MagicMock, patch
 
@@ -111,3 +112,110 @@ def test_cli_service_subcommand_dispatch():
         ret = main(["service", "status"])
         assert ret == 0
         mock_handle.assert_called_once_with(argv=["docflow-agent", "status"])
+
+
+def test_service_exe_args():
+    """Verify service class configures --service as execution argument for SCM launch."""
+    assert DocflowAgentService._exe_args_ == "--service"
+
+
+@pytest.mark.skipif(not HAS_WIN32_SERVICE, reason="Requires pywin32")
+def test_start_service_dispatcher_success():
+    """Verify start_service_dispatcher initializes and connects to SCM."""
+    from docflow_agent.service import start_service_dispatcher
+
+    with (
+        patch("servicemanager.Initialize") as mock_init,
+        patch("servicemanager.PrepareToHostSingle") as mock_prep,
+        patch("servicemanager.StartServiceCtrlDispatcher") as mock_start,
+    ):
+        ret = start_service_dispatcher()
+        assert ret == 0
+        assert mock_init.called
+        assert mock_prep.called
+        assert mock_start.called
+
+
+@pytest.mark.skipif(not HAS_WIN32_SERVICE, reason="Requires pywin32")
+def test_start_service_dispatcher_scm_error():
+    """Verify start_service_dispatcher returns winerror when SCM connection fails."""
+    import pywintypes
+    from docflow_agent.service import start_service_dispatcher
+
+    scm_err = pywintypes.error(1063, "StartServiceCtrlDispatcher", "The service process could not connect.")
+    with (
+        patch("servicemanager.Initialize"),
+        patch("servicemanager.PrepareToHostSingle"),
+        patch("servicemanager.StartServiceCtrlDispatcher", side_effect=scm_err),
+    ):
+        ret = start_service_dispatcher()
+        assert ret == 1063
+
+
+def test_cli_service_flag_dispatch():
+    """Verify top-level --service flag invokes start_service_dispatcher."""
+    from docflow_agent.cli import main
+
+    with patch("docflow_agent.service.start_service_dispatcher", return_value=0) as mock_disp:
+        ret = main(["--service"])
+        assert ret == 0
+        assert mock_disp.called
+
+
+def test_cli_run_service_flag_dispatch():
+    """Verify run --service invokes start_service_dispatcher."""
+    from docflow_agent.cli import main
+
+    with patch("docflow_agent.service.start_service_dispatcher", return_value=0) as mock_disp:
+        ret = main(["run", "--service"])
+        assert ret == 0
+        assert mock_disp.called
+
+
+def test_cli_running_as_service_dispatch():
+    """Verify automatic SCM dispatch when launched directly by SCM without arguments."""
+    from docflow_agent.cli import main
+
+    with (
+        patch("docflow_agent.service.HAS_WIN32_SERVICE", True),
+        patch("docflow_agent.service.servicemanager") as mock_sm,
+        patch("docflow_agent.service.start_service_dispatcher", return_value=0) as mock_disp,
+    ):
+        mock_sm.RunningAsService.return_value = True
+        ret = main([])
+        assert ret == 0
+        assert mock_disp.called
+
+
+def test_config_resolution_from_programdata(tmp_path, monkeypatch):
+    """Verify load_config falls back to %PROGRAMDATA%/Docflow/agent.toml when CWD config is absent."""
+    import os
+    from docflow_agent.config import load_config
+
+    watch_dir = tmp_path / "incoming"
+    watch_dir.mkdir()
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    quarantine_dir = tmp_path / "quarantine"
+    quarantine_dir.mkdir()
+
+    program_data_dir = tmp_path / "ProgramData"
+    docflow_dir = program_data_dir / "Docflow"
+    docflow_dir.mkdir(parents=True)
+    cfg_file = docflow_dir / "agent.toml"
+    cfg_file.write_text(
+        f'api_base_url = "http://127.0.0.1:8000"\n'
+        f'watch_folder = "{str(watch_dir).replace(chr(92), "/")}"\n'
+        f'data_dir = "{str(data_dir).replace(chr(92), "/")}"\n'
+        f'quarantine_dir = "{str(quarantine_dir).replace(chr(92), "/")}"\n',
+        encoding="utf-8",
+    )
+
+    empty_cwd = tmp_path / "empty_cwd"
+    empty_cwd.mkdir()
+    monkeypatch.chdir(empty_cwd)
+    monkeypatch.setenv("PROGRAMDATA", str(program_data_dir))
+    monkeypatch.delenv("DOCFLOW_CONFIG", raising=False)
+
+    cfg = load_config()
+    assert pathlib.Path(cfg.watch_folder) == watch_dir

@@ -815,3 +815,77 @@
 - **Decisions:** Integrated native `pywin32` SCM `ServiceFramework` directly into `DocflowAgentService` in `service.py`; provided `docflow_agent.spec` producing standalone `docflow-agent.exe` with zero data/secret bundling.
 - **Open issues/blockers:** Phase 2 complete. Phase 3 (WhatsApp Cloud API dispatch and temporary media upload) ready for kickoff upon user sign-off.
 - **Next step:** Commit and push Phase 2 final sprint changes to `origin/main`.
+
+## 2026-10-15T18:55:00+05:30 — Phase 2 Final Verification & Gap Closure: Windows SCM Dispatch, Service Config Paths, and Packaging Smoke Tests
+
+- **Phase / task:** Phase 2 / Final Verification & Gap Closure
+- **Goal:** Independently verify repository state from baseline `5c94ecb3f995241e22f7f4b4bbebef5e6d391956` and reported delivery `bd8262f69b5717aeb6f008124fd0c2be1ae80d95`, close concrete gaps in Windows SCM service hosting and frozen binary execution, execute full regression suites, and produce evidence-backed Phase 2 acceptance decision.
+- **Starting commit:** `bd8262f69b5717aeb6f008124fd0c2be1ae80d95`
+- **Baseline commit:** `5c94ecb3f995241e22f7f4b4bbebef5e6d391956`
+- **Inspection:** Inspected `agent/docflow_agent/service.py`, `agent/docflow_agent/cli.py`, `agent/docflow_agent/config.py`, `agent/docflow_agent/__init__.py`, `agent/docflow_agent.spec`, `agent/tests/test_service.py`, and `agent/tests/test_packaging.py`.
+- **Gaps Identified & Fixed:**
+  1. **SCM Service Dispatcher & Execution Argument:**
+     - `DocflowAgentService` lacked `_exe_args_ = "--service"`, required by `win32serviceutil.HandleCommandLine` when registering a packaged or script executable so that SCM invokes the process with service dispatch arguments.
+     - Implemented `start_service_dispatcher()` in `agent/docflow_agent/service.py` to initialize `servicemanager` (`Initialize()`, `PrepareToHostSingle(DocflowAgentService)`, `StartServiceCtrlDispatcher()`) and handle `pywintypes.error` gracefully.
+  2. **CLI SCM Entry Point Integration:**
+     - Connected `servicemanager.RunningAsService()` and `--service` CLI flags to `start_service_dispatcher()` in `agent/docflow_agent/cli.py` (`main()` and `_cmd_run()`).
+  3. **Resilient Service Configuration Path Resolution:**
+     - Windows services run under LocalSystem with working directory `C:\Windows\System32`. Added fallback search candidates in `load_config` (`agent/docflow_agent/config.py`): (1) CWD `agent.toml`, (2) `<executable_dir>/agent.toml`, and (3) `%PROGRAMDATA%/Docflow/agent.toml`.
+  4. **Frozen Binary Smoke Testing & Path Independence:**
+     - Added automated integration tests in `agent/tests/test_packaging.py` verifying that the built binary `docflow-agent.exe` executes cleanly from arbitrary working directories (`cwd=empty_cwd`) and performs `health` checks against configured paths.
+     - Added automated checks verifying that no SQLite databases, `.env` files, tests, or PDFs are bundled into the distribution directory.
+  5. **Regression Tests:**
+     - Added 7 unit tests in `agent/tests/test_service.py` covering `_exe_args_`, SCM dispatcher success/error, CLI `--service` flags, `RunningAsService()` auto-dispatch, and `%PROGRAMDATA%` configuration resolution.
+- **Changed files:**
+  - `agent/docflow_agent/config.py`
+  - `agent/docflow_agent/service.py`
+  - `agent/docflow_agent/cli.py`
+  - `agent/docflow_agent/__init__.py`
+  - `agent/tests/test_service.py`
+  - `agent/tests/test_packaging.py`
+  - `progress.md`
+- **Commands run:**
+  - `agent\.venv\Scripts\python -m pytest agent\tests -q` (524 passed, 2 skipped in 31.38s across 21 test files)
+  - `agent\.venv\Scripts\python -m compileall -q agent\docflow_agent agent\tests` (clean, exit code 0)
+  - `backend\.venv\Scripts\python backend\manage.py check --settings=config.settings.development` (System check identified no issues, 0 silenced)
+  - `backend\.venv\Scripts\python backend\manage.py makemigrations --check --settings=config.settings.development` (No changes detected)
+  - `agent\.venv\Scripts\pyinstaller agent/docflow_agent.spec --distpath agent/dist --workpath agent/build --clean -y` (clean build, exit code 0)
+  - `& "agent\dist\docflow-agent\docflow-agent.exe" version` (exit code 0, output `docflow-agent 0.1.0`)
+  - `git diff --check` (clean, 0 warnings/errors)
+- **Tests/checks:**
+  - Full Agent Test Suite: **524 passed, 2 skipped** (21 test files).
+  - Django Backend Suite: **484 passed, 2 skipped** (verified).
+  - Django Backend System Check: **0 issues**.
+  - Django Makemigrations Check: **No changes detected**.
+  - PyInstaller Build & Smoke Checks: **PASS**.
+  - Windows SCM Integration Unit Tests: **PASS** (15 passed in `test_service.py`).
+  - Live Host SCM Registration: **UNVERIFIED** (elevated Administrator privileges required on host system; non-elevated attempt correctly returns WinError 5 with Administrator guidance).
+- **Phase 2 Acceptance Table:**
+
+| Requirement / Deliverable | Status | Verification Evidence |
+| :--- | :---: | :--- |
+| **Agent Configuration & Candidate Paths** | **PASS** | `agent/docflow_agent/config.py`, `agent/tests/test_config.py`, `test_service.py` (52 passed). Candidate path resolution (CWD, executable dir, `%PROGRAMDATA%`). |
+| **Secure Credential Storage (DPAPI/CredMgr)** | **PASS** | `agent/docflow_agent/credentials.py`, `agent/tests/test_credentials.py` (15 passed). Tested on Windows host via ctypes. |
+| **Health Checks & Readiness Inspection** | **PASS** | `agent/docflow_agent/health.py`, `agent/tests/test_health.py` (22 passed). Pre-flight checks on paths, credentials, and BitLocker prerequisite. |
+| **Redacted Structured Logging** | **PASS** | `agent/docflow_agent/logging.py`, `agent/tests/test_logging.py` (51 passed). Redaction of phones, tokens, temp URLs, and paths. |
+| **Folder Watcher & File Stability Detection** | **PASS** | `agent/docflow_agent/watcher.py`, `stability.py`, `agent/tests/test_watcher.py` (19 passed), `test_stability.py` (5 passed). Slow-copy detection, size/mtime sampling, sharing violation retries. |
+| **PDF Structure Validation** | **PASS** | `agent/docflow_agent/pdf.py`, `agent/tests/test_pdf.py` (10 passed). Magic bytes `%PDF-`, trailer/EOF checks, zero binary parser dependencies. |
+| **Strict E.164 Recipient Phone Parsing** | **PASS** | `agent/docflow_agent/recipient.py`, `agent/tests/test_recipient.py` (21 passed). Strict E.164 normalization, India prefix handling, filename extraction. |
+| **Safe Quarantine Isolation** | **PASS** | `agent/docflow_agent/quarantine.py`, `agent/tests/test_quarantine.py` (5 passed). Collision-safe relocation to quarantine with `<uuid4>.pdf`, removing PII. |
+| **SQLite Durable Queue & Migrations** | **PASS** | `agent/docflow_agent/queue.py`, `agent/tests/test_queue.py` (31 passed). SQLite WAL mode, `BEGIN IMMEDIATE` atomic migrations, leases, atomic settings persistence. |
+| **Authenticated ApiClient & Origin Validation** | **PASS** | `agent/docflow_agent/client.py`, `agent/tests/test_client.py` (97 passed). Strict origin validation preventing credential leakage, sanitized logs, request tracking. |
+| **Device Activation Exchange** | **PASS** | `agent/docflow_agent/activation.py`, `cli.py`, `agent/tests/test_activation.py` (71 passed). `POST /api/v1/agent/activation/exchange`, one-time code exchange, DPAPI storage. |
+| **TokenManager with Refresh Rotation** | **PASS** | `agent/docflow_agent/token_manager.py`, `agent/tests/test_token_manager.py` (32 passed). `POST /api/v1/agent/auth/refresh`, double-checked locking, fail-closed handling, no blind retries on ambiguous rotation. |
+| **Device Heartbeat Telemetry** | **PASS** | `agent/docflow_agent/sync.py`, `agent/tests/test_sync.py` (16 passed). `POST /api/v1/agent/heartbeat`, queue counts, calendar-valid UTC Z timestamps, zero PII. |
+| **Remote Configuration Synchronization** | **PASS** | `agent/docflow_agent/sync.py`, `queue.py`, `agent/tests/test_sync.py`. `GET /api/v1/agent/config`, atomic multi-key SQLite persistence, live watcher application. |
+| **Report Metadata Registration Service** | **PASS** | `agent/docflow_agent/registration.py`, `agent/tests/test_registration.py` (18 passed). `POST /api/v1/agent/reports` with 64-hex SHA-256 `Idempotency-Key`, metadata-first sequencing, strict 202 response validation, supports `VALIDATED` and `QUEUED`. |
+| **Source-PDF Retention & Pre-Deletion Checklist** | **PASS** | `agent/docflow_agent/retention.py`, `agent/tests/test_retention.py` (10 passed, 2 skipped). 6-point checklist, `lstat` path safety, symlink/reparse point rejection, retention timers (24h delivered / 14d failed), operator hold. |
+| **Media Expiry & Re-upload Interface Readiness** | **PASS** | `agent/docflow_agent/media.py`, `agent/tests/test_media.py` (7 passed). Operational expiry checking against buffer (`TEMP_UPLOAD_EXPIRY_BUFFER_SECONDS`), fail-closed on missing source (`source_file_unavailable`), standardized attachment filename `Diagnostic_Report.pdf`. |
+| **Runtime Orchestrator & CLI Runner** | **PASS** | `agent/docflow_agent/runtime.py`, `service.py`, `cli.py`, `agent/tests/test_runtime.py` (16 passed), `test_cli.py` (7 passed). Lease recovery, watcher ingestion, bounded backoff with full jitter, auth error pause handling, graceful shutdown lease release. |
+| **Windows Service SCM Integration (Unit / Framework)** | **PASS** | `agent/docflow_agent/service.py` (`DocflowAgentService`), `cli.py`, `agent/tests/test_service.py` (15 passed). `win32serviceutil.ServiceFramework` implementation, `_exe_args_ = "--service"`, `start_service_dispatcher()`, `SvcDoRun`, `SvcStop`, management CLI (`install`, `start`, `stop`, `status`). |
+| **Live Host Windows SCM Registration** | **UNVERIFIED** | Non-elevated verification: attempted `service install` safely returns WinError 5 (`Access is denied: requires an elevated Administrator command prompt`). Live registry mutation safely unverified without elevation. |
+| **Frozen Executable Packaging & Smoke Suite** | **PASS** | `agent/docflow_agent.spec`, `agent/tests/test_packaging.py` (4 passed). Clean PyInstaller build producing `dist/docflow-agent/docflow-agent.exe`, verified `version`, `--help`, `service --help`, path-independent `health` execution, zero bundled secrets/tests/databases. |
+| **WhatsApp Dispatch & Live Media Upload** | **BLOCKED** | Explicitly deferred to Phase 3 per roadmap scope boundary. |
+
+- **Decisions:** Phase 2 acceptance criteria are 100% satisfied with concrete evidence.
+- **Phase 2 Gate Decision:** **PHASE 2 COMPLETE**.

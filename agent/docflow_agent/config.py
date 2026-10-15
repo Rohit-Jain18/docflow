@@ -505,9 +505,21 @@ def load_config(
         if config_file_str:
             config_file = pathlib.Path(config_file_str)
         else:
-            candidate = pathlib.Path("agent.toml")
-            if candidate.is_file():
-                config_file = candidate
+            candidates: list[pathlib.Path] = [pathlib.Path("agent.toml")]
+            try:
+                exe_dir = pathlib.Path(sys.executable).parent
+                candidates.append(exe_dir / "agent.toml")
+            except Exception:
+                pass
+            program_data = os.environ.get("PROGRAMDATA", "")
+            if program_data:
+                candidates.append(pathlib.Path(program_data) / "Docflow" / "agent.toml")
+
+            for cand in candidates:
+                if cand.is_file():
+                    config_file = cand
+                    break
+
 
     if config_file is not None:
         path = pathlib.Path(config_file)
