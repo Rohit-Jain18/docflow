@@ -11,6 +11,7 @@ SECURITY.md §§ 2, 7, 8, and OPEN_QUESTIONS.md:
 """
 
 import re
+from typing import Any
 import uuid
 
 from django.conf import settings
@@ -347,6 +348,7 @@ class AuditEvent(models.Model):
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization_id: uuid.UUID | None
     organization = models.ForeignKey(
         Organization,
         on_delete=models.PROTECT,
@@ -356,6 +358,7 @@ class AuditEvent(models.Model):
         verbose_name="organization",
         help_text="Tenant boundary. Nullable only for explicit platform-level actions.",
     )
+    actor_user_id: uuid.UUID | None
     actor_user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -364,6 +367,7 @@ class AuditEvent(models.Model):
         related_name="audit_events",
         verbose_name="actor user",
     )
+    actor_device_id: uuid.UUID | None
     actor_device = models.ForeignKey(
         Device,
         on_delete=models.SET_NULL,
@@ -425,7 +429,7 @@ class AuditEvent(models.Model):
         ]
 
     def __str__(self) -> str:
-        org_label = self.organization.slug if self.organization_id else "platform"
+        org_label = self.organization.slug if self.organization else "platform"
         return f"AuditEvent {self.action} [{org_label}] at {self.timestamp}"
 
     def clean(self) -> None:
@@ -434,7 +438,7 @@ class AuditEvent(models.Model):
         self._validate_invariants()
 
     def _validate_invariants(self) -> None:
-        errors = {}
+        errors: dict[str, Any] = {}
 
         # 1. Organization requirement: Nullable only for explicit platform-level actions
         is_platform_action = self.action in PLATFORM_AUDIT_ACTIONS

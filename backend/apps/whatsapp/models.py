@@ -14,6 +14,7 @@ Enforces:
   - No raw access tokens stored in credential_secret_ref.
 """
 
+from collections.abc import Callable
 import uuid
 
 from django.conf import settings
@@ -47,6 +48,9 @@ class WhatsAppAccount(models.Model):
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization_id: uuid.UUID
+    created_by_id: uuid.UUID | None
+    get_status_display: Callable[[], str]
     organization = models.ForeignKey(
         Organization,
         on_delete=models.CASCADE,
@@ -178,18 +182,21 @@ class BranchWhatsAppAssignment(models.Model):
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization_id: uuid.UUID
     organization = models.ForeignKey(
         Organization,
         on_delete=models.CASCADE,
         related_name="whatsapp_assignments",
         verbose_name="organization",
     )
+    branch_id: uuid.UUID
     branch = models.ForeignKey(
         Branch,
         on_delete=models.CASCADE,
         related_name="whatsapp_assignments",
         verbose_name="branch",
     )
+    whatsapp_account_id: uuid.UUID
     whatsapp_account = models.ForeignKey(
         WhatsAppAccount,
         on_delete=models.CASCADE,
@@ -202,6 +209,7 @@ class BranchWhatsAppAssignment(models.Model):
         default=AssignmentStatus.ACTIVE,
         verbose_name="status",
     )
+    assigned_by_id: uuid.UUID | None
     assigned_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,

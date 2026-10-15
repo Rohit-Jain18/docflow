@@ -15,6 +15,7 @@ Enforces:
 """
 
 import re
+from typing import Any
 import uuid
 from django.conf import settings
 from django.core.exceptions import ValidationError
@@ -240,7 +241,7 @@ class AgentReportRegistrationView(APIView):
             request_id=request_id,
         )
 
-        res = Response(result["data"], status=result["status_code"])
+        res = Response(result["data"], status=int(result["status_code"]))
         res["X-Request-ID"] = request_id
         return res
 
@@ -252,7 +253,7 @@ class AgentReportRegistrationView(APIView):
         idempotency_key,
         fingerprint,
         request_id,
-    ):
+    ) -> dict[str, Any]:
         """Execute transactional idempotency check, conflict detection, and record creation."""
         try:
             with transaction.atomic():
@@ -447,6 +448,7 @@ class AgentMediaReferenceAttachmentView(APIView):
                 .filter(id=report.id)
                 .first()
             )
+            assert locked_report is not None
 
             # Recheck tenant hierarchy
             if (
@@ -685,7 +687,7 @@ class AgentReportDetailView(APIView):
         elif report.quarantined_reason_code:
             last_safe_error = report.quarantined_reason_code
 
-        data = {
+        data: dict[str, Any] = {
             "report_id": str(report.id),
             "status": report.status,
             "created_at": report.created_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -745,9 +747,10 @@ class AgentReportListView(APIView):
 
         paginator = self.pagination_class()
         page = paginator.paginate_queryset(queryset, request, view=self)
+        page_items = page if page is not None else list(queryset)
 
         results = []
-        for r in page:
+        for r in page_items:
             attempts = list(r.delivery_attempts.all())
             latest_attempt = max(attempts, key=lambda a: a.attempt_number) if attempts else None
             last_safe_error = None

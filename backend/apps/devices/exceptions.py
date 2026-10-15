@@ -172,8 +172,9 @@ def api_exception_handler(exc: Exception, context: Dict[str, Any]) -> Optional[R
 
         if isinstance(exc, Throttled):
             detail = str(exc.detail) if hasattr(exc, "detail") else "Request was throttled."
-            if exc.wait:
-                response["Retry-After"] = str(int(exc.wait))
+            wait_seconds = getattr(exc, "wait", None)
+            if wait_seconds is not None:
+                response["Retry-After"] = str(int(wait_seconds))
         elif isinstance(response.data, dict):
             if "detail" in response.data and len(response.data) == 1:
                 detail = str(response.data["detail"])

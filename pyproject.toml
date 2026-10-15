@@ -1,24 +1,14 @@
 [tool.pyright]
 include = ["backend"]
+exclude = ["backend/tests"]
 extraPaths = ["backend"]
 pythonVersion = "3.13"
 venvPath = "backend"
 venv = ".venv"
-typeCheckingMode = "off"
+typeCheckingMode = "basic"
 
 [tool.pyrefly]
 search-path = [
     "backend"
 ]
 python-interpreter-path = "backend/.venv/Scripts/python.exe"
-
-[tool.pyrefly.errors]
-missing-attribute = false
-bad-argument-type = false
-bad-override = false
-bad-override-mutable-attribute = false
-unsupported-operation = false
-bad-assignment = false
-not-iterable = false
-missing-import = false
-no-matching-overload = false

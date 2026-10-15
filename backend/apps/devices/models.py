@@ -13,6 +13,7 @@ Enforces cross-table tenant consistency:
 Never stores raw secrets or activation codes.
 """
 
+from collections.abc import Callable
 import datetime
 import uuid
 
@@ -45,12 +46,14 @@ class Device(models.Model):
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization_id: uuid.UUID
     organization = models.ForeignKey(
         Organization,
         on_delete=models.CASCADE,
         related_name="devices",
         verbose_name="organization",
     )
+    branch_id: uuid.UUID
     branch = models.ForeignKey(
         Branch,
         on_delete=models.CASCADE,
@@ -58,6 +61,7 @@ class Device(models.Model):
         verbose_name="branch",
     )
     name = models.CharField(max_length=255, verbose_name="name")
+    get_status_display: Callable[[], str]
     status = models.CharField(
         max_length=30,
         choices=DeviceStatus.choices,
@@ -188,24 +192,28 @@ class DeviceActivationCode(models.Model):
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization_id: uuid.UUID
     organization = models.ForeignKey(
         Organization,
         on_delete=models.CASCADE,
         related_name="activation_codes",
         verbose_name="organization",
     )
+    branch_id: uuid.UUID
     branch = models.ForeignKey(
         Branch,
         on_delete=models.CASCADE,
         related_name="activation_codes",
         verbose_name="branch",
     )
+    device_id: uuid.UUID
     device = models.ForeignKey(
         Device,
         on_delete=models.CASCADE,
         related_name="activation_codes",
         verbose_name="device",
     )
+    created_by_id: uuid.UUID | None
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -353,6 +361,7 @@ class DeviceRefreshCredential(models.Model):
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    device_id: uuid.UUID
     device = models.ForeignKey(
         Device,
         on_delete=models.CASCADE,
@@ -377,6 +386,7 @@ class DeviceRefreshCredential(models.Model):
         blank=True,
         verbose_name="revoked at",
     )
+    replaced_by_id: uuid.UUID | None
     replaced_by = models.OneToOneField(
         "self",
         on_delete=models.SET_NULL,

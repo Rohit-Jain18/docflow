@@ -31,7 +31,7 @@ class DeviceAdmin(admin.ModelAdmin):
 
     def get_readonly_fields(self, request, obj=None):
         if obj:
-            return self.readonly_fields + ("organization",)
+            return tuple(self.readonly_fields) + ("organization",)
         return self.readonly_fields
 
 

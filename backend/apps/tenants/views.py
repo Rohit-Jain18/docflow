@@ -328,7 +328,9 @@ class LabListCreateView(APIView):
                     raise serializers.ValidationError(
                         {"organization_id": ["organization_id is required when user manages multiple organizations."]}
                     )
-                target_org = admin_memberships.first().organization
+                first_membership = admin_memberships.first()
+                assert first_membership is not None
+                target_org = first_membership.organization
 
         code = serializer.validated_data["code"]
         if Lab.objects.filter(organization=target_org, code=code).exists():

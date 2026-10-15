@@ -28,9 +28,9 @@ class CSRFEnforcedSessionAuthentication(SessionAuthentication):
         def dummy_get_response(r):
             return None
 
-        check = CSRFCheck(dummy_get_response)
+        check = CSRFCheck(dummy_get_response)  # type: ignore[arg-type]  # pyrefly: ignore[bad-argument-type]
         check.process_request(raw_request)
-        reason = check.process_view(raw_request, None, (), {})
+        reason = check.process_view(raw_request, None, (), {})  # type: ignore[arg-type]  # pyrefly: ignore[bad-argument-type]
         if reason:
             raise PermissionDenied(f"CSRF Failed: {reason}")
 

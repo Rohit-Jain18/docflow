@@ -55,9 +55,10 @@ class ActivationRateThrottle(SafeIPRateThrottle):
     def get_rate(self):
         rf_settings = getattr(settings, "REST_FRAMEWORK", {})
         rates = rf_settings.get("DEFAULT_THROTTLE_RATES", {})
-        if self.scope in rates:
-            return rates[self.scope]
-        return self.THROTTLE_RATES.get(self.scope, self.default_rate)
+        scope = self.scope or ""
+        if scope in rates:
+            return rates[scope]
+        return self.THROTTLE_RATES.get(scope, self.default_rate)
 
 
 class RefreshRateThrottle(SafeIPRateThrottle):
@@ -73,9 +74,10 @@ class RefreshRateThrottle(SafeIPRateThrottle):
     def get_rate(self):
         rf_settings = getattr(settings, "REST_FRAMEWORK", {})
         rates = rf_settings.get("DEFAULT_THROTTLE_RATES", {})
-        if self.scope in rates:
-            return rates[self.scope]
-        return self.THROTTLE_RATES.get(self.scope, self.default_rate)
+        scope = self.scope or ""
+        if scope in rates:
+            return rates[scope]
+        return self.THROTTLE_RATES.get(scope, self.default_rate)
 
 
 class UserLoginRateThrottle(SafeIPRateThrottle):
@@ -91,8 +93,9 @@ class UserLoginRateThrottle(SafeIPRateThrottle):
     def get_rate(self):
         rf_settings = getattr(settings, "REST_FRAMEWORK", {})
         rates = rf_settings.get("DEFAULT_THROTTLE_RATES", {})
-        if self.scope in rates:
-            return rates[self.scope]
-        return self.THROTTLE_RATES.get(self.scope, self.default_rate)
+        scope = self.scope or ""
+        if scope in rates:
+            return rates[scope]
+        return self.THROTTLE_RATES.get(scope, self.default_rate)
 
 

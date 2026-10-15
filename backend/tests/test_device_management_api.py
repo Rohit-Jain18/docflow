@@ -14,12 +14,12 @@ Covers:
 """
 
 import datetime
+from typing import Any
 import uuid
 from django.core.cache import cache
-from django.test import TestCase
 from django.utils import timezone as tz_utils
 from rest_framework import status
-from rest_framework.test import APIClient
+from rest_framework.test import APIClient, APITestCase
 
 from apps.audit.models import AuditAction, AuditEvent
 from apps.devices.models import (
@@ -48,7 +48,7 @@ from apps.tenants.models import (
 from apps.users.models import User
 
 
-class DeviceManagementAPIBaseTestCase(TestCase):
+class DeviceManagementAPIBaseTestCase(APITestCase):
     def setUp(self):
         super().setUp()
         cache.clear()
@@ -185,7 +185,9 @@ class DeviceManagementAPIBaseTestCase(TestCase):
         """Helper to create an authenticated APIClient with CSRF cookies and token."""
         client = APIClient(enforce_csrf_checks=True)
         client.get("/api/v1/auth/csrf")
-        csrf_token = client.cookies.get("csrftoken").value
+        cookie = client.cookies.get("csrftoken")
+        assert cookie is not None
+        csrf_token = cookie.value
         if user:
             client.force_login(user)
         return client, csrf_token
@@ -427,7 +429,7 @@ class DeviceDetailAndPatchTests(DeviceManagementAPIBaseTestCase):
 
     def test_device_patch_rejects_protected_fields(self):
         client, csrf_token = self.get_client(user=self.org_a_admin)
-        protected_fields = [
+        protected_fields: list[dict[str, Any]] = [
             {"status": DeviceStatus.ACTIVE},
             {"organization_id": str(self.org_b.id)},
             {"branch_id": str(self.branch_b1.id)},

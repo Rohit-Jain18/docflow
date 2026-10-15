@@ -41,7 +41,7 @@ class ReportAdmin(admin.ModelAdmin):
 
     def get_readonly_fields(self, request, obj=None):
         if obj:
-            return self.readonly_fields + (
+            return tuple(self.readonly_fields) + (
                 "organization",
                 "lab",
                 "branch",
@@ -73,7 +73,7 @@ class MediaReferenceAdmin(admin.ModelAdmin):
 
     def get_readonly_fields(self, request, obj=None):
         if obj:
-            return self.readonly_fields + ("report", "kind")
+            return tuple(self.readonly_fields) + ("report", "kind")
         return self.readonly_fields
 
 
@@ -102,7 +102,7 @@ class DeliveryAttemptAdmin(admin.ModelAdmin):
 
     def get_readonly_fields(self, request, obj=None):
         if obj:
-            return self.readonly_fields + ("organization", "report", "attempt_number")
+            return tuple(self.readonly_fields) + ("organization", "report", "attempt_number")
         return self.readonly_fields
 
 

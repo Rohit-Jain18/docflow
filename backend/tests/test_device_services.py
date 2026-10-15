@@ -13,6 +13,7 @@ Covers:
 
 import datetime
 import threading
+from typing import Any
 import unittest
 import uuid
 from unittest.mock import patch
@@ -76,7 +77,7 @@ class DeviceServiceBaseTestCase(TestCase):
             name="Other Branch",
             code="OB01",
         )
-        self.user = User.objects.create_user(
+        self.user = User.objects.create_user(  # pyrefly: ignore[missing-attribute]
             email="manager@labcorp.test",
             password="secure-password-123",
             display_name="Branch Manager",
@@ -727,8 +728,8 @@ class DeviceServiceAtomicityAndConcurrencyTests(TransactionTestCase):
         at most one successful redemption, and the losing request sees the updated consumed state.
         """
         issued = issue_activation_code(self.device)
-        results = [None, None]
-        errors = [None, None]
+        results: list[Any] = [None, None]
+        errors: list[Any] = [None, None]
 
         def activate_worker(idx):
             try:
@@ -784,8 +785,8 @@ class DeviceServiceAtomicityAndConcurrencyTests(TransactionTestCase):
         )
         refresh_token = activation.refresh_token
 
-        results = [None, None]
-        errors = [None, None]
+        results: list[Any] = [None, None]
+        errors: list[Any] = [None, None]
 
         def refresh_worker(idx):
             try:

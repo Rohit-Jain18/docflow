@@ -80,5 +80,5 @@ class WebhookReceiptAdmin(admin.ModelAdmin):
     def get_readonly_fields(self, request, obj=None):
         if obj:
             # Identity fields are immutable on persisted instances
-            return self.readonly_fields + ("provider_key", "external_event_key")
+            return tuple(self.readonly_fields) + ("provider_key", "external_event_key")
         return self.readonly_fields

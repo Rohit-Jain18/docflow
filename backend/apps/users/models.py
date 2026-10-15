@@ -80,7 +80,7 @@ class User(AbstractBaseUser, PermissionsMixin):
     privileges are kept in separate models/fields rather than groups alone.
     """
 
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)  # pyrefly: ignore[bad-override-mutable-attribute]
     email = models.EmailField(
         unique=True,
         verbose_name="email address",
@@ -112,7 +112,7 @@ class User(AbstractBaseUser, PermissionsMixin):
     created_at = models.DateTimeField(default=timezone.now, editable=False)
     updated_at = models.DateTimeField(auto_now=True)
 
-    objects = UserManager()
+    objects: UserManager = UserManager()
 
     USERNAME_FIELD = "email"
     REQUIRED_FIELDS = []  # email is already the username field

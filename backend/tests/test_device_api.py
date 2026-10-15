@@ -26,10 +26,10 @@ import datetime
 from unittest.mock import patch
 
 from django.core.cache import cache
-from django.test import TestCase, override_settings
+from django.test import override_settings
 from django.utils import timezone as tz_utils
 from rest_framework import status
-from rest_framework.test import APIClient
+from rest_framework.test import APIClient, APITestCase
 
 from apps.audit.models import AuditAction, AuditEvent
 from apps.devices.models import (
@@ -54,7 +54,9 @@ from apps.devices.ip_utils import (
 from apps.devices.throttling import ActivationRateThrottle, RefreshRateThrottle
 
 
-class DeviceAPIBaseTestCase(TestCase):
+class DeviceAPIBaseTestCase(APITestCase):
+    client: APIClient
+
     def setUp(self):
         cache.clear()
         self.client = APIClient()

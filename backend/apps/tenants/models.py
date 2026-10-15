@@ -98,12 +98,14 @@ class OrganizationMembership(models.Model):
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization_id: uuid.UUID
     organization = models.ForeignKey(
         Organization,
         on_delete=models.CASCADE,
         related_name="memberships",
         verbose_name="organization",
     )
+    user_id: uuid.UUID
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
@@ -160,6 +162,7 @@ class Lab(models.Model):
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization_id: uuid.UUID
     organization = models.ForeignKey(
         Organization,
         on_delete=models.CASCADE,
@@ -264,12 +267,14 @@ class Branch(models.Model):
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization_id: uuid.UUID
     organization = models.ForeignKey(
         Organization,
         on_delete=models.CASCADE,
         related_name="branches",
         verbose_name="organization",
     )
+    lab_id: uuid.UUID
     lab = models.ForeignKey(
         Lab,
         on_delete=models.CASCADE,

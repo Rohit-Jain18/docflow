@@ -16,8 +16,10 @@ Enforces:
   - Immutability of persisted identity relationships and attempt numbering.
 """
 
+from collections.abc import Callable
 import hashlib
 import re
+from typing import Any
 import uuid
 
 from django.conf import settings
@@ -152,24 +154,28 @@ class Report(models.Model):
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization_id: uuid.UUID
     organization = models.ForeignKey(
         Organization,
         on_delete=models.CASCADE,
         related_name="reports",
         verbose_name="organization",
     )
+    lab_id: uuid.UUID
     lab = models.ForeignKey(
         Lab,
         on_delete=models.CASCADE,
         related_name="reports",
         verbose_name="lab",
     )
+    branch_id: uuid.UUID
     branch = models.ForeignKey(
         Branch,
         on_delete=models.CASCADE,
         related_name="reports",
         verbose_name="branch",
     )
+    device_id: uuid.UUID | None
     device = models.ForeignKey(
         Device,
         on_delete=models.SET_NULL,
@@ -178,6 +184,7 @@ class Report(models.Model):
         related_name="reports",
         verbose_name="device",
     )
+    branch_assignment_id: uuid.UUID | None
     branch_assignment = models.ForeignKey(
         BranchWhatsAppAssignment,
         on_delete=models.SET_NULL,
@@ -186,6 +193,9 @@ class Report(models.Model):
         related_name="reports",
         verbose_name="branch WhatsApp assignment",
     )
+    media_references: Any
+    delivery_attempts: Any
+    get_status_display: Callable[[], str]
     recipient_phone_e164 = models.CharField(
         max_length=32,
         verbose_name="recipient phone (E.164)",
@@ -498,6 +508,7 @@ class MediaReference(models.Model):
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    report_id: uuid.UUID
     report = models.ForeignKey(
         Report,
         on_delete=models.CASCADE,
@@ -637,12 +648,14 @@ class DeliveryAttempt(models.Model):
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization_id: uuid.UUID
     organization = models.ForeignKey(
         Organization,
         on_delete=models.CASCADE,
         related_name="delivery_attempts",
         verbose_name="organization",
     )
+    report_id: uuid.UUID
     report = models.ForeignKey(
         Report,
         on_delete=models.CASCADE,
@@ -802,18 +815,21 @@ class DeliveryEvent(models.Model):
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization_id: uuid.UUID
     organization = models.ForeignKey(
         Organization,
         on_delete=models.CASCADE,
         related_name="delivery_events",
         verbose_name="organization",
     )
+    report_id: uuid.UUID
     report = models.ForeignKey(
         Report,
         on_delete=models.CASCADE,
         related_name="delivery_events",
         verbose_name="report",
     )
+    delivery_attempt_id: uuid.UUID | None
     delivery_attempt = models.ForeignKey(
         DeliveryAttempt,
         on_delete=models.SET_NULL,
@@ -880,7 +896,7 @@ class DeliveryEvent(models.Model):
         self._validate_event()
 
     def _validate_event(self) -> None:
-        errors = {}
+        errors: dict[str, Any] = {}
 
         # Tenant consistency: organization must match report organization
         if self.report_id and self.organization_id:
@@ -968,18 +984,21 @@ class DispatchOutbox(models.Model):
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization_id: uuid.UUID
     organization = models.ForeignKey(
         Organization,
         on_delete=models.CASCADE,
         related_name="outbox_items",
         verbose_name="organization",
     )
+    report_id: uuid.UUID
     report = models.ForeignKey(
         Report,
         on_delete=models.CASCADE,
         related_name="outbox_items",
         verbose_name="report",
     )
+    delivery_attempt_id: uuid.UUID | None
     delivery_attempt = models.ForeignKey(
         DeliveryAttempt,
         on_delete=models.CASCADE,
