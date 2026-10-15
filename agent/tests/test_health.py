@@ -1,7 +1,6 @@
 """Tests for docflow_agent.health — health check module."""
 
 import pathlib
-
 import pytest
 
 from docflow_agent.config import AgentConfig
@@ -59,6 +58,13 @@ class TestHealthCheckSuccess:
         url_check = [c for c in result.checks if c.name == "API base URL"][0]
         assert "HTTPS" in url_check.detail
 
+    def test_loopback_http_shows_development(self, tmp_path: pathlib.Path) -> None:
+        config = _make_config(tmp_path, api_base_url="http://127.0.0.1:8000")
+        result = health_check(config=config)
+        assert result.healthy is True
+        url_check = [c for c in result.checks if c.name == "API base URL"][0]
+        assert "development" in url_check.detail
+
     def test_archive_will_be_created(self, tmp_path: pathlib.Path) -> None:
         config = _make_config(tmp_path)
         result = health_check(config=config)
@@ -93,6 +99,35 @@ class TestHealthCheckFailure:
         assert result.healthy is False
         log_check = [c for c in result.checks if c.name == "Log level"][0]
         assert log_check.passed is False
+
+    def test_malformed_url_reports_unhealthy(self, tmp_path: pathlib.Path) -> None:
+        # Non-loopback HTTP
+        config1 = _make_config(tmp_path, api_base_url="http://remote.example.com")
+        res1 = health_check(config=config1)
+        assert res1.healthy is False
+        url_check1 = [c for c in res1.checks if c.name == "API base URL"][0]
+        assert url_check1.passed is False
+        assert "Plain HTTP is only permitted for loopback" in url_check1.detail
+
+        # URL with query string
+        config2 = _make_config(tmp_path, api_base_url="https://docflow.example.com?token=123")
+        res2 = health_check(config=config2)
+        assert res2.healthy is False
+        url_check2 = [c for c in res2.checks if c.name == "API base URL"][0]
+        assert url_check2.passed is False
+
+    def test_corrupt_toml_reports_controlled_failure(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        bad_toml = tmp_path / "corrupt.toml"
+        bad_toml.write_text("invalid [[ toml syntax", encoding="utf-8")
+        monkeypatch.setenv("DOCFLOW_AGENT_CONFIG_FILE", str(bad_toml))
+
+        result = health_check()
+        assert result.healthy is False
+        config_check = [c for c in result.checks if c.name == "Configuration"][0]
+        assert config_check.passed is False
+        assert "Failed to read or parse config file" in config_check.detail
 
     def test_forbidden_secret_environment_variable(self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("WA_PLATFORM_DEVELOPER_TOKEN", "EAAB_test_token")

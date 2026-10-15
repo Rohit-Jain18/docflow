@@ -17,9 +17,12 @@ secure-store interface.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import pathlib
+import re
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -75,8 +78,23 @@ _ENV_ALIASES: dict[str, str] = {
 # Fields that MUST be set to a non-empty value
 _REQUIRED_FIELDS = frozenset({"api_base_url", "watch_folder"})
 
-# Prohibited secret keys that must never be in configuration
-_PROHIBITED_SECRET_KEYS = frozenset({
+
+class ConfigError(Exception):
+    """Raised when agent configuration is invalid or incomplete."""
+
+
+# ---------------------------------------------------------------------------
+# Key normalization & Prohibited secret detection
+# ---------------------------------------------------------------------------
+
+def normalize_key(key: Any) -> str:
+    """Normalize a key by converting camelCase, hyphens, and spaces to snake_case."""
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(key))
+    s = re.sub(r"[-.\s]+", "_", s).lower()
+    return s.strip("_")
+
+
+_PROHIBITED_KEY_STEMS = frozenset({
     "wa_platform_developer_token",
     "whatsapp_token",
     "device_token",
@@ -85,11 +103,128 @@ _PROHIBITED_SECRET_KEYS = frozenset({
     "access_token",
     "secret_key",
     "password",
+    "secret",
+    "credential",
+    "token",
+    "authorization",
 })
 
+_PROHIBITED_SUBSTRINGS = (
+    "wa_platform_developer_token",
+    "whatsapp_token",
+    "device_token",
+    "device_refresh_token",
+    "refresh_token",
+    "access_token",
+    "secret_key",
+    "password",
+    "secret",
+    "credential",
+    "authorization",
+)
 
-class ConfigError(Exception):
-    """Raised when agent configuration is invalid or incomplete."""
+
+def is_prohibited_key(key: Any) -> bool:
+    """Check if normalized key represents a prohibited secret key."""
+    norm = normalize_key(key)
+    if norm in _PROHIBITED_KEY_STEMS:
+        return True
+    parts = norm.split("_")
+    for part in parts:
+        if part in ("password", "secret", "credential", "authorization"):
+            return True
+    for sub in _PROHIBITED_SUBSTRINGS:
+        if sub in norm:
+            return True
+    if norm.endswith("_token") or norm.startswith("token_"):
+        return True
+    return False
+
+
+def _inspect_toml_for_secrets(data: Any, path_prefix: str = "") -> list[str]:
+    """Recursively search a parsed TOML structure for prohibited secret keys.
+
+    Returns the list of matching key paths (e.g. 'security.password').
+    Never includes values.
+    """
+    prohibited: list[str] = []
+    if isinstance(data, dict):
+        for k, v in data.items():
+            current_path = f"{path_prefix}.{k}" if path_prefix else str(k)
+            if is_prohibited_key(str(k)):
+                prohibited.append(current_path)
+            if isinstance(v, (dict, list)):
+                prohibited.extend(_inspect_toml_for_secrets(v, current_path))
+    elif isinstance(data, list):
+        for idx, item in enumerate(data):
+            current_path = f"{path_prefix}[{idx}]"
+            prohibited.extend(_inspect_toml_for_secrets(item, current_path))
+    return prohibited
+
+
+# ---------------------------------------------------------------------------
+# URL Validation
+# ---------------------------------------------------------------------------
+
+def is_loopback_host(hostname: str) -> bool:
+    """Return True if hostname is a loopback destination."""
+    if not hostname:
+        return False
+    clean = hostname.strip("[]").lower()
+    if clean == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(clean).is_loopback
+    except ValueError:
+        return False
+
+
+def validate_api_base_url(url: str) -> list[str]:
+    """Validate API base URL according to security rules.
+
+    Rules:
+    - Must be a non-empty string.
+    - Scheme must be http or https.
+    - Hostname is required.
+    - Userinfo (username/password) is prohibited.
+    - Query strings and URL fragments are prohibited.
+    - Plain HTTP is permitted ONLY for loopback development destinations (localhost, 127.0.0.1, ::1).
+    - Non-loopback destinations MUST use HTTPS.
+    """
+    if not url or not isinstance(url, str) or not url.strip():
+        return ["'api_base_url' is missing or empty."]
+
+    raw_url = url.strip()
+    try:
+        parsed = urllib.parse.urlsplit(raw_url)
+    except Exception as exc:
+        return [f"'api_base_url' is malformed: {exc}"]
+
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https"):
+        return [f"'api_base_url' scheme must be http or https, got: {parsed.scheme!r}"]
+
+    hostname = parsed.hostname
+    if not hostname:
+        return [f"'api_base_url' must include a valid hostname, got: {raw_url!r}"]
+
+    if parsed.username is not None or parsed.password is not None or ("@" in parsed.netloc):
+        return ["'api_base_url' must not include userinfo (username/password)."]
+
+    if parsed.query:
+        return [f"'api_base_url' must not include query parameters, got: {parsed.query!r}"]
+
+    if parsed.fragment:
+        return [f"'api_base_url' must not include a fragment, got: {parsed.fragment!r}"]
+
+    if scheme == "http" and not is_loopback_host(hostname):
+        return [
+            f"'api_base_url' uses unencrypted HTTP for non-loopback host {hostname!r}. "
+            "Plain HTTP is only permitted for loopback development destinations (localhost, 127.0.0.1); "
+            "non-loopback destinations require HTTPS."
+        ]
+
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -124,36 +259,85 @@ class AgentConfig:
 # TOML loading (stdlib tomllib, Python 3.11+)
 # ---------------------------------------------------------------------------
 def _load_toml(path: pathlib.Path) -> dict[str, Any]:
-    """Load a TOML config file, returning the [agent] table or top-level."""
+    """Load a TOML config file, inspecting the entire document for secrets."""
     import tomllib
 
-    with path.open("rb") as fh:
-        data = tomllib.load(fh)
+    try:
+        with path.open("rb") as fh:
+            raw_data = tomllib.load(fh)
+    except (tomllib.TOMLDecodeError, OSError) as exc:
+        raise ConfigError(f"Failed to read or parse config file '{path}': {exc}") from exc
+
+    # Recursively check the entire TOML structure before selecting settings
+    prohibited_keys = _inspect_toml_for_secrets(raw_data)
+    if prohibited_keys:
+        formatted = ", ".join(f"'{k}'" for k in sorted(prohibited_keys))
+        raise ConfigError(
+            f"Prohibited secret configuration detected in '{path}': {formatted}. "
+            "Secret material must never be placed in configuration files."
+        )
+
     # Support both [agent] section and top-level keys
-    return dict(data.get("agent", data))
+    return dict(raw_data.get("agent", raw_data))
 
 
 # ---------------------------------------------------------------------------
 # Environment loading
 # ---------------------------------------------------------------------------
 def _load_env(raw_env: dict[str, str] | None = None) -> dict[str, str]:
-    """Collect environment variables from aliases, DOCFLOW_AGENT_* prefix, and direct keys."""
+    """Collect environment variables from aliases and DOCFLOW_AGENT_* prefix,
+    detecting and rejecting any prohibited secret variables."""
     env_source = os.environ if raw_env is None else raw_env
+
+    # Detect prohibited secret keys without case or separator bypasses
+    for key in env_source:
+        norm_key = normalize_key(key)
+        is_agent_scoped = (
+            raw_env is not None
+            or norm_key.startswith("docflow_agent_")
+            or norm_key.startswith("docflow_")
+            or norm_key in (
+                "wa_platform_developer_token",
+                "whatsapp_token",
+                "device_token",
+                "device_refresh_token",
+                "refresh_token",
+                "access_token",
+                "secret_key",
+                "password",
+            )
+        )
+        if is_agent_scoped:
+            stripped = norm_key
+            if stripped.startswith("docflow_agent_"):
+                stripped = stripped[len("docflow_agent_"):]
+            elif stripped.startswith("docflow_"):
+                stripped = stripped[len("docflow_"):]
+            if is_prohibited_key(stripped) or is_prohibited_key(norm_key):
+                raise ConfigError(
+                    f"Prohibited secret key '{key}' detected in environment. "
+                    "Secrets must be stored in secure credential storage, never environment variables."
+                )
+
     result: dict[str, str] = {}
 
-    # Check documented aliases first
+    # Check documented aliases first (case-insensitive)
+    normalized_env = {normalize_key(k): v for k, v in env_source.items()}
     for env_var, config_key in _ENV_ALIASES.items():
-        if env_var in env_source:
-            result[config_key] = env_source[env_var]
+        norm_alias = normalize_key(env_var)
+        if norm_alias in normalized_env:
+            result[config_key] = normalized_env[norm_alias]
 
-    # Check direct keys and DOCFLOW_AGENT_* prefix (higher priority)
+    # Prefix DOCFLOW_AGENT_* has higher priority over aliases
     for key, value in env_source.items():
-        upper = key.upper()
-        if upper.startswith(_ENV_PREFIX):
-            config_key = upper[len(_ENV_PREFIX):].lower()
+        norm_k = normalize_key(key)
+        if norm_k.startswith("docflow_agent_"):
+            config_key = norm_k[len("docflow_agent_"):]
             result[config_key] = value
-        elif key in _DEFAULTS or key.lower() in _DEFAULTS or key in _PROHIBITED_SECRET_KEYS:
-            result[key.lower()] = value
+        elif raw_env is not None:
+            # If explicit env dict was passed (testing), support direct keys
+            if norm_k in _DEFAULTS or key in _DEFAULTS:
+                result[norm_k] = value
 
     return result
 
@@ -192,11 +376,11 @@ def _validate(values: dict[str, Any]) -> list[str]:
     """Return a list of human-readable validation errors (empty = valid)."""
     errors: list[str] = []
 
-    # Prohibited secret keys check
-    for secret_key in _PROHIBITED_SECRET_KEYS:
-        if secret_key in values:
+    # Prohibited secret keys check in merged values
+    for secret_key in values:
+        if is_prohibited_key(secret_key):
             errors.append(
-                f"Prohibited secret key '{secret_key}' found in configuration. "
+                f"Prohibited secret configuration '{secret_key}' detected. "
                 "Secrets must be stored in secure credential storage, never plaintext config."
             )
 
@@ -205,12 +389,10 @@ def _validate(values: dict[str, Any]) -> list[str]:
         if not values.get(name):
             errors.append(f"Required configuration '{name}' is missing or empty.")
 
-    # API URL must look like a URL
-    url = values.get("api_base_url", "")
-    if url and not (url.startswith("http://") or url.startswith("https://")):
-        errors.append(
-            f"'api_base_url' must start with http:// or https://, got: {url!r}"
-        )
+    # API base URL validation
+    url_val = values.get("api_base_url", "")
+    if url_val:
+        errors.extend(validate_api_base_url(url_val))
 
     # Watch folder must be an existing directory (when provided)
     watch = values.get("watch_folder", "")

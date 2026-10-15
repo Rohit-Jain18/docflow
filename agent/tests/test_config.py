@@ -6,13 +6,18 @@ import textwrap
 
 import pytest
 
-from docflow_agent.config import AgentConfig, ConfigError, load_config
+from docflow_agent.config import (
+    AgentConfig,
+    ConfigError,
+    is_loopback_host,
+    load_config,
+    validate_api_base_url,
+)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
 
 def _make_valid_env(tmp_path: pathlib.Path) -> dict[str, str]:
     """Return a minimal valid environment dict for testing."""
@@ -31,7 +36,6 @@ def _make_valid_env(tmp_path: pathlib.Path) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 # Valid configuration
 # ---------------------------------------------------------------------------
-
 
 class TestValidConfig:
     """Test that valid configurations load successfully."""
@@ -69,6 +73,13 @@ class TestValidConfig:
         config = load_config(env=env)
         assert config.api_base_url == "https://docflow.example.com"
 
+    def test_loopback_http_urls_accepted(self, tmp_path: pathlib.Path) -> None:
+        env = _make_valid_env(tmp_path)
+        for loopback in ("http://localhost:8000", "http://127.0.0.1:8000", "http://[::1]:8000"):
+            env["api_base_url"] = loopback
+            config = load_config(env=env)
+            assert config.api_base_url == loopback
+
     def test_config_is_frozen(self, tmp_path: pathlib.Path) -> None:
         env = _make_valid_env(tmp_path)
         config = load_config(env=env)
@@ -105,22 +116,23 @@ class TestValidConfig:
             watch_folder = "{watch.as_posix()}"
             archive_folder = "{archive.as_posix()}"
             quarantine_folder = "{quarantine.as_posix()}"
-            log_level = "WARNING"
+            stability_sample_seconds = 4
         """)
         config_file = tmp_path / "agent.toml"
         config_file.write_text(toml_content, encoding="utf-8")
-        env = {"log_level": "ERROR"}
-        config = load_config(config_file=config_file, env=env)
-        assert config.log_level == "ERROR"
+        config = load_config(
+            config_file=config_file,
+            env={"stability_sample_seconds": "9"},
+        )
+        assert config.stability_sample_seconds == 9
 
 
 # ---------------------------------------------------------------------------
-# Missing required values
+# Missing required fields
 # ---------------------------------------------------------------------------
-
 
 class TestMissingRequired:
-    """Test that missing required values produce clear errors."""
+    """Test that missing required fields raise ConfigError."""
 
     def test_missing_api_base_url(self, tmp_path: pathlib.Path) -> None:
         env = _make_valid_env(tmp_path)
@@ -142,29 +154,72 @@ class TestMissingRequired:
 
 
 # ---------------------------------------------------------------------------
-# Invalid configuration
+# URL Validation
 # ---------------------------------------------------------------------------
 
+class TestUrlValidation:
+    """Detailed URL parser validation tests."""
+
+    def test_plain_http_non_loopback_rejected(self, tmp_path: pathlib.Path) -> None:
+        env = _make_valid_env(tmp_path)
+        env["api_base_url"] = "http://api.docflow.example.com"
+        with pytest.raises(ConfigError, match="Plain HTTP is only permitted for loopback"):
+            load_config(env=env)
+
+    def test_plain_http_lan_ip_rejected(self, tmp_path: pathlib.Path) -> None:
+        env = _make_valid_env(tmp_path)
+        env["api_base_url"] = "http://192.168.1.50:8000"
+        with pytest.raises(ConfigError, match="Plain HTTP is only permitted for loopback"):
+            load_config(env=env)
+
+    def test_url_userinfo_rejected(self, tmp_path: pathlib.Path) -> None:
+        env = _make_valid_env(tmp_path)
+        env["api_base_url"] = "https://user:password@docflow.example.com"
+        with pytest.raises(ConfigError, match="userinfo"):
+            load_config(env=env)
+
+    def test_url_query_string_rejected(self, tmp_path: pathlib.Path) -> None:
+        env = _make_valid_env(tmp_path)
+        env["api_base_url"] = "https://docflow.example.com?key=value"
+        with pytest.raises(ConfigError, match="query parameters"):
+            load_config(env=env)
+
+    def test_url_fragment_rejected(self, tmp_path: pathlib.Path) -> None:
+        env = _make_valid_env(tmp_path)
+        env["api_base_url"] = "https://docflow.example.com#section"
+        with pytest.raises(ConfigError, match="fragment"):
+            load_config(env=env)
+
+    def test_url_missing_hostname(self, tmp_path: pathlib.Path) -> None:
+        env = _make_valid_env(tmp_path)
+        env["api_base_url"] = "https:///api"
+        with pytest.raises(ConfigError, match="valid hostname"):
+            load_config(env=env)
+
+    def test_url_invalid_scheme(self, tmp_path: pathlib.Path) -> None:
+        env = _make_valid_env(tmp_path)
+        env["api_base_url"] = "ftp://localhost:8000"
+        with pytest.raises(ConfigError, match="scheme must be http or https"):
+            load_config(env=env)
+
+
+# ---------------------------------------------------------------------------
+# Invalid configuration & Secrets detection
+# ---------------------------------------------------------------------------
 
 class TestInvalidConfig:
-    """Test that invalid configurations are rejected."""
-
-    def test_bad_url_scheme(self, tmp_path: pathlib.Path) -> None:
-        env = _make_valid_env(tmp_path)
-        env["api_base_url"] = "ftp://not-http.example.com"
-        with pytest.raises(ConfigError, match="http://.*https://"):
-            load_config(env=env)
+    """Test that invalid configuration values raise ConfigError."""
 
     def test_nonexistent_watch_folder(self, tmp_path: pathlib.Path) -> None:
         env = _make_valid_env(tmp_path)
-        env["watch_folder"] = str(tmp_path / "nonexistent")
+        env["watch_folder"] = str(tmp_path / "does_not_exist")
         with pytest.raises(ConfigError, match="does not exist"):
             load_config(env=env)
 
     def test_non_integer_stability(self, tmp_path: pathlib.Path) -> None:
         env = _make_valid_env(tmp_path)
-        env["stability_sample_seconds"] = "not_a_number"
-        with pytest.raises(ConfigError, match="integer"):
+        env["stability_sample_seconds"] = "abc"
+        with pytest.raises(ConfigError, match="must be an integer"):
             load_config(env=env)
 
     def test_zero_stability_samples(self, tmp_path: pathlib.Path) -> None:
@@ -173,9 +228,7 @@ class TestInvalidConfig:
         with pytest.raises(ConfigError, match="stability_required_samples"):
             load_config(env=env)
 
-    def test_failed_retention_days_out_of_range(
-        self, tmp_path: pathlib.Path
-    ) -> None:
+    def test_failed_retention_days_out_of_range(self, tmp_path: pathlib.Path) -> None:
         env = _make_valid_env(tmp_path)
         env["failed_retention_days"] = "100"
         with pytest.raises(ConfigError, match="failed_retention_days"):
@@ -205,19 +258,102 @@ class TestInvalidConfig:
         with pytest.raises(ConfigError, match="not found"):
             load_config(config_file="nonexistent.toml", env={})
 
+    def test_toml_decode_error_raises_config_error(self, tmp_path: pathlib.Path) -> None:
+        bad_toml = tmp_path / "bad.toml"
+        bad_toml.write_text("this is not = [valid toml", encoding="utf-8")
+        with pytest.raises(ConfigError, match="Failed to read or parse config file"):
+            load_config(config_file=bad_toml, env={})
+
     def test_negative_max_pdf_size(self, tmp_path: pathlib.Path) -> None:
         env = _make_valid_env(tmp_path)
         env["max_pdf_size_bytes"] = "-1"
         with pytest.raises(ConfigError, match="max_pdf_size_bytes"):
             load_config(env=env)
 
-    def test_prohibited_secret_in_config(self, tmp_path: pathlib.Path) -> None:
+
+# ---------------------------------------------------------------------------
+# Prohibited secrets tests
+# ---------------------------------------------------------------------------
+
+class TestProhibitedSecrets:
+    """Verify that prohibited secret keys are detected in TOML and environment without value leakage."""
+
+    @pytest.mark.parametrize(
+        "env_key",
+        [
+            "DOCFLOW_AGENT_REFRESH_TOKEN",
+            "DOCFLOW_AGENT_refreshToken",
+            "DOCFLOW_AGENT_refresh-token",
+            "docflow_agent_deviceToken",
+            "DOCFLOW_AGENT_DEVICE_TOKEN",
+            "DOCFLOW_AGENT_DEVICE-TOKEN",
+            "DOCFLOW_AGENT_PASSWORD",
+            "DOCFLOW_AGENT_SECRET_KEY",
+            "WA_PLATFORM_DEVELOPER_TOKEN",
+            "wa_platform_developer_token",
+            "DEVICE_TOKEN",
+            "REFRESH_TOKEN",
+        ],
+    )
+    def test_environment_secret_keys_rejected(self, tmp_path: pathlib.Path, env_key: str) -> None:
+        secret_val = "SUPER_SECRET_PAYLOAD_VALUE_9999"
         env = _make_valid_env(tmp_path)
-        env["wa_platform_developer_token"] = "EAAB..."
-        with pytest.raises(ConfigError, match="Prohibited secret key"):
+        env[env_key] = secret_val
+
+        with pytest.raises(ConfigError) as exc_info:
             load_config(env=env)
 
-    def test_environment_aliases(self, tmp_path: pathlib.Path) -> None:
+        err_msg = str(exc_info.value)
+        assert "Prohibited secret key" in err_msg
+        # Secret value must NEVER leak in the error message
+        assert secret_val not in err_msg
+
+    def test_nested_toml_secret_keys_rejected(self, tmp_path: pathlib.Path) -> None:
+        watch = tmp_path / "watch"
+        watch.mkdir(exist_ok=True)
+        secret_val = "TOP_SECRET_TOML_VALUE_8888"
+
+        toml_content = textwrap.dedent(f"""\
+            [agent]
+            api_base_url = "http://localhost:8000"
+            watch_folder = "{watch.as_posix()}"
+
+            [security.credentials]
+            refreshToken = "{secret_val}"
+        """)
+        config_file = tmp_path / "secrets.toml"
+        config_file.write_text(toml_content, encoding="utf-8")
+
+        with pytest.raises(ConfigError) as exc_info:
+            load_config(config_file=config_file, env={})
+
+        err_msg = str(exc_info.value)
+        assert "Prohibited secret configuration detected" in err_msg
+        assert "security.credentials.refreshToken" in err_msg
+        # Secret value must NEVER leak in error message
+        assert secret_val not in err_msg
+
+    def test_camel_case_and_hyphen_in_toml_rejected(self, tmp_path: pathlib.Path) -> None:
+        watch = tmp_path / "watch"
+        watch.mkdir(exist_ok=True)
+
+        toml_content = textwrap.dedent(f"""\
+            [agent]
+            api_base_url = "http://localhost:8000"
+            watch_folder = "{watch.as_posix()}"
+            device-token = "secret123"
+        """)
+        config_file = tmp_path / "hyphen_secret.toml"
+        config_file.write_text(toml_content, encoding="utf-8")
+
+        with pytest.raises(ConfigError) as exc_info:
+            load_config(config_file=config_file, env={})
+
+        err_msg = str(exc_info.value)
+        assert "device-token" in err_msg
+        assert "secret123" not in err_msg
+
+    def test_environment_aliases_preserved(self, tmp_path: pathlib.Path) -> None:
         watch = tmp_path / "watch"
         watch.mkdir(exist_ok=True)
         archive = tmp_path / "archive"

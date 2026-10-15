@@ -1,16 +1,22 @@
 """Tests for docflow_agent.logging — redaction and logger setup."""
 
+import io
 import logging
-
 import pytest
 
-from docflow_agent.logging import RedactionFilter, redact, setup_logging
+from docflow_agent.logging import (
+    RedactionFilter,
+    is_sensitive_key,
+    normalize_key,
+    redact,
+    redact_value,
+    setup_logging,
+)
 
 
 # ---------------------------------------------------------------------------
 # Redaction
 # ---------------------------------------------------------------------------
-
 
 class TestRedaction:
     """Verify sensitive values are scrubbed from log messages."""
@@ -68,9 +74,107 @@ class TestRedaction:
 
 
 # ---------------------------------------------------------------------------
-# RedactionFilter
+# Sensitive key normalization & detection
 # ---------------------------------------------------------------------------
 
+class TestKeyNormalization:
+    """Verify key normalization and sensitive key detection."""
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "access_token",
+            "accessToken",
+            "access-token",
+            "ACCESS_TOKEN",
+            "refresh_token",
+            "refreshToken",
+            "refresh-token",
+            "REFRESH_TOKEN",
+            "device_token",
+            "deviceToken",
+            "device-token",
+            "DEVICE_TOKEN",
+            "authorization",
+            "Authorization",
+            "AUTHORIZATION",
+            "password",
+            "userPassword",
+            "secret",
+            "clientSecret",
+            "credential",
+            "deviceCredential",
+            "wa_platform_developer_token",
+        ],
+    )
+    def test_sensitive_keys_detected(self, key: str) -> None:
+        assert is_sensitive_key(key) is True
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "status",
+            "report_id",
+            "file_size_bytes",
+            "mtime_ns",
+            "watch_folder",
+            "phone_default_region",
+        ],
+    )
+    def test_safe_keys_not_flagged(self, key: str) -> None:
+        assert is_sensitive_key(key) is False
+
+
+# ---------------------------------------------------------------------------
+# Recursive value redaction
+# ---------------------------------------------------------------------------
+
+class TestRecursiveRedaction:
+    """Verify recursive redaction on nested dicts, lists, and tuples."""
+
+    def test_nested_dictionary_redacted(self) -> None:
+        data = {
+            "meta": {"status": "ok", "version": 1},
+            "auth": {
+                "accessToken": "secret-access-token-123",
+                "refresh-token": "secret-refresh-token-456",
+                "nested": {
+                    "deviceToken": "device-token-789",
+                    "Password": "superpassword",
+                    "safe": "visible",
+                },
+            },
+        }
+        redacted = redact_value(data)
+        assert redacted["meta"]["status"] == "ok"
+        assert redacted["auth"]["accessToken"] == "[REDACTED]"
+        assert redacted["auth"]["refresh-token"] == "[REDACTED]"
+        assert redacted["auth"]["nested"]["deviceToken"] == "[REDACTED]"
+        assert redacted["auth"]["nested"]["Password"] == "[REDACTED]"
+        assert redacted["auth"]["nested"]["safe"] == "visible"
+        assert "secret-access-token-123" not in str(redacted)
+        assert "secret-refresh-token-456" not in str(redacted)
+        assert "superpassword" not in str(redacted)
+
+    def test_list_and_tuple_nested_redacted(self) -> None:
+        data = [
+            {"name": "batch1", "secret": "shhh"},
+            ({"item": "tuple_entry", "Authorization": "Bearer secret_jwt"},),
+            "safe string with phone +919876543210",
+        ]
+        redacted = redact_value(data)
+        assert redacted[0]["name"] == "batch1"
+        assert redacted[0]["secret"] == "[REDACTED]"
+        assert redacted[1][0]["Authorization"] == "[REDACTED]"
+        assert "3210" in redacted[2]
+        assert "******" in redacted[2]
+        assert "shhh" not in str(redacted)
+        assert "secret_jwt" not in str(redacted)
+
+
+# ---------------------------------------------------------------------------
+# RedactionFilter
+# ---------------------------------------------------------------------------
 
 class TestRedactionFilter:
     """Verify the logging filter applies redaction."""
@@ -115,21 +219,52 @@ class TestRedactionFilter:
             args=None,
             exc_info=None,
         )
-        # Set dict args after construction to avoid Python 3.13
-        # LogRecord.__init__ indexing issue with Mapping detection.
         record.args = {"token": "secret=mysecretvalue"}
         filt.filter(record)
         assert isinstance(record.args, dict)
         assert "mysecretvalue" not in str(record.args["token"])
+
+    def test_filter_redacts_nested_args(self) -> None:
+        filt = RedactionFilter()
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg="Event: %s",
+            args=None,
+            exc_info=None,
+        )
+        record.args = ({"auth": {"accessToken": "top_secret_token_val", "safe": 123}},)
+        filt.filter(record)
+        assert isinstance(record.args, tuple)
+        assert "top_secret_token_val" not in str(record.args)
+        assert record.args[0]["auth"]["accessToken"] == "[REDACTED]"
+        assert record.args[0]["auth"]["safe"] == 123
+
+    def test_filter_redacts_structured_message(self) -> None:
+        filt = RedactionFilter()
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg={"event": "login", "refreshToken": "secret_refresh_token_xyz"},
+            args=(),
+            exc_info=None,
+        )
+        filt.filter(record)
+        assert isinstance(record.msg, dict)
+        assert record.msg["refreshToken"] == "[REDACTED]"
+        assert "secret_refresh_token_xyz" not in str(record.msg)
 
 
 # ---------------------------------------------------------------------------
 # Logger initialization
 # ---------------------------------------------------------------------------
 
-
 class TestSetupLogging:
-    """Verify logger initialization."""
+    """Verify logger initialization and formatting scrub."""
 
     def test_returns_logger(self) -> None:
         logger = setup_logging(level="DEBUG")
@@ -165,6 +300,30 @@ class TestSetupLogging:
         content = log_path.read_text(encoding="utf-8")
         assert "my-secret-jwt-token" not in content
         assert "[REDACTED]" in content
+
+    def test_nested_dict_output_in_stream_and_file_redacted(self, tmp_path) -> None:
+        stream = io.StringIO()
+        log_path = tmp_path / "nested_test.log"
+        logger = setup_logging(level="INFO", stream=stream, log_file=log_path)
+
+        logger.info("Event payload: %s", {
+            "credentials": {"accessToken": "exposed_secret_1234"},
+            "user": "dr_smith",
+        })
+        for h in logger.handlers:
+            h.flush()
+
+        # Check console stream output
+        stream_val = stream.getvalue()
+        assert "exposed_secret_1234" not in stream_val
+        assert "[REDACTED]" in stream_val
+        assert "dr_smith" in stream_val
+
+        # Check file output
+        file_val = log_path.read_text(encoding="utf-8")
+        assert "exposed_secret_1234" not in file_val
+        assert "[REDACTED]" in file_val
+        assert "dr_smith" in file_val
 
     @pytest.fixture(autouse=True)
     def _cleanup_logger(self) -> None:  # type: ignore[misc]

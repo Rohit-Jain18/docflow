@@ -9,7 +9,7 @@ The health check inspects:
 2. Watch-folder access (existence and read permissions).
 3. Write permissions (archive folder, quarantine folder, database path).
 4. Credential readiness (OS credential store accessibility, refresh token readiness).
-5. API base URL and connection scheme.
+5. API base URL and connection scheme (strict hostname, no userinfo/query/fragment, loopback HTTP vs HTTPS).
 6. Log level validity.
 7. Secret exposure safeguards (ensuring no plaintext secrets exist in config/env).
 
@@ -24,9 +24,17 @@ from __future__ import annotations
 import logging
 import os
 import pathlib
+import urllib.parse
 from dataclasses import dataclass
 
-from docflow_agent.config import AgentConfig, ConfigError, load_config
+from docflow_agent.config import (
+    AgentConfig,
+    ConfigError,
+    is_prohibited_key,
+    load_config,
+    normalize_key,
+    validate_api_base_url,
+)
 from docflow_agent.credentials import CredentialStore, get_credential_store
 
 logger = logging.getLogger(__name__)
@@ -127,20 +135,37 @@ def _check_credential_store(credential_store: CredentialStore | None = None) -> 
 
 def _check_secrets_exposure() -> CheckItem:
     """Verify that dangerous plaintext secrets are not exposed in the environment."""
-    forbidden_vars = [
-        "WA_PLATFORM_DEVELOPER_TOKEN",
-        "WHATSAPP_TOKEN",
-        "DEVICE_TOKEN",
-        "DEVICE_REFRESH_TOKEN",
-        "DOCFLOW_AGENT_DEVICE_TOKEN",
-        "DOCFLOW_AGENT_REFRESH_TOKEN",
-    ]
-    exposed = [var for var in forbidden_vars if var in os.environ]
+    exposed = []
+    for key in os.environ:
+        norm_k = normalize_key(key)
+        is_agent_scoped = (
+            norm_k.startswith("docflow_agent_")
+            or norm_k.startswith("docflow_")
+            or norm_k in (
+                "wa_platform_developer_token",
+                "whatsapp_token",
+                "device_token",
+                "device_refresh_token",
+                "refresh_token",
+                "access_token",
+                "secret_key",
+                "password",
+            )
+        )
+        if is_agent_scoped:
+            stripped = norm_k
+            if stripped.startswith("docflow_agent_"):
+                stripped = stripped[len("docflow_agent_"):]
+            elif stripped.startswith("docflow_"):
+                stripped = stripped[len("docflow_"):]
+            if is_prohibited_key(stripped) or is_prohibited_key(norm_k):
+                exposed.append(key)
+
     if exposed:
         return CheckItem(
             name="Secret safeguards",
             passed=False,
-            detail=f"Forbidden secret variables detected in environment: {', '.join(exposed)}",
+            detail=f"Forbidden secret variables detected in environment: {', '.join(sorted(exposed))}",
         )
     return CheckItem(
         name="Secret safeguards",
@@ -207,24 +232,23 @@ def health_check(
     checks.append(_check_secrets_exposure())
 
     # 8. API base URL
-    url = config.api_base_url
-    if url.startswith("https://"):
-        checks.append(CheckItem(
-            name="API base URL",
-            passed=True,
-            detail="HTTPS configured.",
-        ))
-    elif url.startswith("http://"):
-        checks.append(CheckItem(
-            name="API base URL",
-            passed=True,
-            detail="HTTP configured (development only).",
-        ))
-    else:
+    url_errors = validate_api_base_url(config.api_base_url)
+    if url_errors:
         checks.append(CheckItem(
             name="API base URL",
             passed=False,
-            detail=f"Invalid URL scheme: {url!r}",
+            detail="; ".join(url_errors),
+        ))
+    else:
+        parsed = urllib.parse.urlsplit(config.api_base_url)
+        if parsed.scheme.lower() == "https":
+            detail = "HTTPS configured."
+        else:
+            detail = f"HTTP configured on loopback host ({parsed.hostname}) for development."
+        checks.append(CheckItem(
+            name="API base URL",
+            passed=True,
+            detail=detail,
         ))
 
     # 9. Log level validity
