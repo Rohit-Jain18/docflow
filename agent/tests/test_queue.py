@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import pathlib
 import sqlite3
@@ -143,6 +144,98 @@ class TestDatabaseInitialization:
             JobQueue(db_path, migrations=bad_migrations)
 
         assert db_path.exists()
+
+    def test_migration_atomicity_rollback_on_partial_failure(
+        self, tmp_path: pathlib.Path,
+    ) -> None:
+        db_path = tmp_path / "atomic_mig.db"
+
+        # 1. Base database at version 1
+        v1_migrations = [(1, "CREATE TABLE table_base (id INT PRIMARY KEY, title TEXT);")]
+        queue = JobQueue(db_path, migrations=v1_migrations)
+        assert queue.get_schema_version() == 1
+
+        # Insert a record into table_base to prove database is populated and active
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("INSERT INTO table_base (id, title) VALUES (1, 'initial');")
+        conn.commit()
+        conn.close()
+
+        # 2. Faulty migration v2: valid schema change followed by an intentional SQL failure
+        faulty_v2_sql = """
+        CREATE TABLE table_feature_x (id INT PRIMARY KEY, name TEXT);
+        INSERT INTO non_existent_table_that_fails_syntax_error VALUES (123);
+        """
+        failing_migrations = [
+            (1, "CREATE TABLE table_base (id INT PRIMARY KEY, title TEXT);"),
+            (2, faulty_v2_sql),
+        ]
+
+        # 3. Attempting migration must fail with MigrationError
+        with pytest.raises(MigrationError):
+            JobQueue(db_path, migrations=failing_migrations)
+
+        # 4. Verify atomicity:
+        # - The valid table 'table_feature_x' must be completely rolled back (does NOT exist)
+        # - Version 2 must NOT be recorded in schema_migrations
+        # - Original database and data must remain intact and usable
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = {r[0] for r in cur.fetchall()}
+        assert "table_feature_x" not in tables
+        assert "table_base" in tables
+
+        cur.execute("SELECT version FROM schema_migrations;")
+        versions = [r[0] for r in cur.fetchall()]
+        assert versions == [1]
+
+        cur.execute("SELECT title FROM table_base WHERE id = 1;")
+        assert cur.fetchone()[0] == "initial"
+        conn.close()
+
+        # 5. Fix the migration and retry safely on reopen
+        fixed_v2_sql = """
+        CREATE TABLE table_feature_x (id INT PRIMARY KEY, name TEXT);
+        CREATE INDEX idx_feature_x_name ON table_feature_x(name);
+        """
+        fixed_migrations = [
+            (1, "CREATE TABLE table_base (id INT PRIMARY KEY, title TEXT);"),
+            (2, fixed_v2_sql),
+        ]
+
+        queue_fixed = JobQueue(db_path, migrations=fixed_migrations)
+        assert queue_fixed.get_schema_version() == 2
+
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables_after = {r[0] for r in cur.fetchall()}
+        conn.close()
+        assert "table_feature_x" in tables_after
+        assert "table_base" in tables_after
+
+    def test_concurrent_database_initialization(self, tmp_path: pathlib.Path) -> None:
+        db_path = tmp_path / "concurrent_init.db"
+
+        def init_worker(worker_id: int) -> int:
+            q = JobQueue(db_path)
+            return q.get_schema_version()
+
+        # Simultaneously spin up 10 workers initializing the same database
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(init_worker, i) for i in range(10)]
+            results = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+        # All workers must see schema version 1 without error
+        assert all(v == 1 for v in results)
+
+        # Ensure exactly one version 1 record was written
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.execute("SELECT version FROM schema_migrations;")
+        versions = [r[0] for r in cur.fetchall()]
+        conn.close()
+        assert versions == [1]
 
     def test_foreign_key_enforcement(self, tmp_path: pathlib.Path) -> None:
         db_path = tmp_path / "fk.db"

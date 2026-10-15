@@ -322,6 +322,25 @@ def sanitize_event_details(details: dict[str, Any] | None) -> dict[str, Any] | N
     return sanitized or None
 
 
+def split_sql_script(script: str) -> list[str]:
+    """Split a SQL script into individual executable statements using sqlite3.complete_statement."""
+    statements: list[str] = []
+    current_statement: list[str] = []
+    for line in script.splitlines(keepends=True):
+        current_statement.append(line)
+        combined = "".join(current_statement)
+        if sqlite3.complete_statement(combined):
+            stmt = combined.strip()
+            if stmt:
+                statements.append(stmt)
+            current_statement = []
+    if current_statement:
+        combined = "".join(current_statement).strip()
+        if combined:
+            statements.append(combined)
+    return statements
+
+
 # ---------------------------------------------------------------------------
 # Database Migrations
 # ---------------------------------------------------------------------------
@@ -509,35 +528,57 @@ class JobQueue:
                 conn.close()
 
     def _initialize_database(self) -> None:
-        """Ensure schema_migrations exists and apply pending migrations in order."""
+        """Ensure schema_migrations exists and apply pending migrations atomically in order."""
         conn = self._connect()
         try:
-            # Create migrations table if needed
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS schema_migrations (
-                    version INTEGER PRIMARY KEY,
-                    applied_at TEXT NOT NULL
-                );
-            """)
+            # 1. Ensure schema_migrations table exists under an immediate write lock
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS schema_migrations (
+                        version INTEGER PRIMARY KEY,
+                        applied_at TEXT NOT NULL
+                    );
+                """)
+                conn.execute("COMMIT")
+            except Exception:
+                if conn.in_transaction:
+                    with contextlib.suppress(Exception):
+                        conn.execute("ROLLBACK")
+                raise
 
-            cur = conn.execute("SELECT version FROM schema_migrations ORDER BY version ASC;")
-            applied_versions = {row["version"] for row in cur.fetchall()}
-
+            # 2. Apply each pending migration in self._migrations atomically
             for version, sql in self._migrations:
-                if version not in applied_versions:
-                    try:
-                        conn.executescript(sql)
-                        now_iso = datetime.now(timezone.utc).isoformat()
-                        conn.execute(
-                            "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?);",
-                            (version, now_iso),
-                        )
-                        applied_versions.add(version)
-                    except Exception as exc:
-                        raise MigrationError(
-                            f"Migration to schema version {version} failed: {exc}. "
-                            "Preserving database file for diagnosis."
-                        ) from exc
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    cur = conn.execute(
+                        "SELECT 1 FROM schema_migrations WHERE version = ?;",
+                        (version,),
+                    )
+                    if cur.fetchone() is not None:
+                        # Already applied by another process or earlier step
+                        conn.execute("COMMIT")
+                        continue
+
+                    # Execute each statement in the migration within the active transaction
+                    statements = split_sql_script(sql)
+                    for stmt in statements:
+                        conn.execute(stmt)
+
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    conn.execute(
+                        "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?);",
+                        (version, now_iso),
+                    )
+                    conn.execute("COMMIT")
+                except Exception as exc:
+                    if conn.in_transaction:
+                        with contextlib.suppress(Exception):
+                            conn.execute("ROLLBACK")
+                    raise MigrationError(
+                        f"Migration to schema version {version} failed: {exc}. "
+                        "Preserving database file for diagnosis."
+                    ) from exc
         finally:
             conn.close()
 
