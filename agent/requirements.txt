@@ -1,2 +1,6 @@
 # Docflow Windows Agent – Python 3.13
 # Core dependencies only. No Django, no backend deps.
+
+watchdog>=4.0.0,<7.0.0
+phonenumbers>=8.13.0,<10.0.0
+
