@@ -231,7 +231,16 @@ def validate_pdf(
                 reason_code="file_modified_during_validation",
             )
     except OSError:
-        pass  # If post-stat fails after successful read, we accept the bytes read
+        return ValidationResult(
+            source_path=file_path,
+            source_basename=basename,
+            recipient_phone_e164=recipient_e164,
+            content_sha256=None,
+            file_size_bytes=initial_size,
+            mtime_ns=initial_mtime_ns,
+            is_valid=False,
+            reason_code="source_file_unavailable",
+        )
 
     sha256_hex = hasher.hexdigest()
     masked = mask_phone(recipient_e164 or "")

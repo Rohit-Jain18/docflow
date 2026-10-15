@@ -1,8 +1,11 @@
 """Tests for docflow_agent.watcher — folder watcher module."""
 
+import os
 import pathlib
+import stat
 import threading
 import time
+from typing import Any
 import pytest
 
 from docflow_agent.pdf import DEFAULT_MAX_PDF_SIZE_BYTES
@@ -47,6 +50,79 @@ class TestCandidateFiltering:
             p = tmp_path / name
             p.write_bytes(b"dummy")
             assert is_candidate_file(p) is False
+
+    def test_rejects_symbolic_links(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        p = tmp_path / "sample.pdf"
+        p.write_bytes(b"dummy")
+
+        # Simulate symlink detection
+        monkeypatch.setattr(pathlib.Path, "is_symlink", lambda self: True)
+        assert is_candidate_file(p) is False
+
+    def test_rejects_file_reparse_points(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        p = tmp_path / "reparse.pdf"
+        p.write_bytes(b"dummy")
+
+        real_lstat = os.lstat(p)
+
+        class FakeLstat:
+            def __init__(self) -> None:
+                self.st_mode = real_lstat.st_mode
+                # Set FILE_ATTRIBUTE_REPARSE_POINT (0x400)
+                self.st_file_attributes = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+        monkeypatch.setattr(os, "lstat", lambda path: FakeLstat())
+        assert is_candidate_file(p) is False
+
+    def test_rejects_files_outside_watch_folder(self, tmp_path: pathlib.Path) -> None:
+        watch = tmp_path / "watch"
+        outside = tmp_path / "outside"
+        watch.mkdir()
+        outside.mkdir()
+
+        outside_file = outside / "outside.pdf"
+        outside_file.write_bytes(b"dummy")
+
+        # Outside file checked against watch folder
+        assert is_candidate_file(outside_file, watch_folder=watch) is False
+
+    def test_rejects_subdirectory_files_top_level_only(self, tmp_path: pathlib.Path) -> None:
+        watch = tmp_path / "watch"
+        sub = watch / "subdir"
+        watch.mkdir()
+        sub.mkdir()
+
+        sub_file = sub / "sub.pdf"
+        sub_file.write_bytes(b"dummy")
+
+        # Files in subdirectories must be rejected (top level only)
+        assert is_candidate_file(sub_file, watch_folder=watch) is False
+
+    def test_rejects_outside_symlink_resolving_outside_watch_folder(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        watch = tmp_path / "watch"
+        outside = tmp_path / "outside"
+        watch.mkdir()
+        outside.mkdir()
+
+        candidate = watch / "link_to_outside.pdf"
+        candidate.write_bytes(b"dummy")
+        target_outside = outside / "target.pdf"
+        target_outside.write_bytes(b"dummy")
+
+        # Simulate resolve pointing outside watch folder
+        monkeypatch.setattr(
+            pathlib.Path, "resolve",
+            lambda self, strict=False: target_outside if self == candidate else watch.resolve(),
+        )
+
+        assert is_candidate_file(candidate, watch_folder=watch) is False
+
 
 
 class TestWatcherLifecycleAndDeduplication:
@@ -302,3 +378,86 @@ class TestPipelineCandidateProcessing:
         # Must NOT quarantine
         assert quar is None
         assert file_path.exists()
+
+    def test_pipeline_outside_watch_folder_is_ignored_and_never_quarantined(
+        self, tmp_path: pathlib.Path,
+    ) -> None:
+        watch = tmp_path / "watch"
+        outside = tmp_path / "outside"
+        quarantine = tmp_path / "quarantine"
+        watch.mkdir()
+        outside.mkdir()
+        quarantine.mkdir()
+
+        # A file outside the watch folder
+        outside_file = outside / "9876543210.pdf"
+        outside_file.write_bytes(_create_mock_pdf())
+
+        stab, val, quar = process_candidate_file(
+            outside_file,
+            watch_folder=watch,
+            quarantine_folder=quarantine,
+            sample_interval_seconds=0.01,
+            required_samples=2,
+            timeout_seconds=5.0,
+            sleep_fn=lambda s: None,
+        )
+
+        assert stab.is_stable is False
+        assert stab.reason_code == "outside_watch_folder"
+        # Must NOT quarantine
+        assert quar is None
+        # File must remain untouched
+        assert outside_file.exists()
+        assert len(list(quarantine.iterdir())) == 0
+
+    def test_watcher_scan_ignores_subdirectories_and_reparse_links(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        watch = tmp_path / "watch"
+        sub = watch / "subdir"
+        watch.mkdir()
+        sub.mkdir()
+
+        # Valid top-level file
+        top_file = watch / "9876543210.pdf"
+        top_file.write_bytes(_create_mock_pdf())
+
+        # Subdirectory file
+        sub_file = sub / "9876543211.pdf"
+        sub_file.write_bytes(_create_mock_pdf())
+
+        # Reparse point file in top level
+        reparse_file = watch / "9876543212.pdf"
+        reparse_file.write_bytes(_create_mock_pdf())
+
+        real_lstat = os.lstat
+
+        class FakeLstat:
+            def __init__(self, real: os.stat_result) -> None:
+                self.st_mode = real.st_mode
+                self.st_file_attributes = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+        def mock_lstat(path: Any) -> Any:
+            res = real_lstat(path)
+            if pathlib.Path(path) == reparse_file:
+                return FakeLstat(res)
+            return res
+
+        monkeypatch.setattr(os, "lstat", mock_lstat)
+
+        discovered: list[pathlib.Path] = []
+        watcher = Watcher(
+            watch_folder=watch,
+            on_candidate=lambda p: discovered.append(p),
+            rescan_interval_seconds=0,
+        )
+
+        try:
+            found = watcher.scan()
+            # Only top_file should be found; sub_file and reparse_file must be ignored
+            assert len(found) == 1
+            assert found[0].name == "9876543210.pdf"
+        finally:
+            watcher.stop()
+

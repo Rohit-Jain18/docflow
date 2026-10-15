@@ -140,3 +140,29 @@ class TestPDFValidation:
         assert res.is_valid is False
         assert res.reason_code == "invalid_filename"
         assert res.recipient_phone_e164 is None
+
+    def test_final_metadata_stat_oserror_fails_closed(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        p = tmp_path / "9876543210.pdf"
+        p.write_bytes(_create_mock_pdf())
+
+        call_count = 0
+        real_stat = pathlib.Path.stat
+
+        def mock_path_stat(path_obj: pathlib.Path) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count > 1:
+                # Post-read stat fails with OSError (e.g. file deleted/unmounted)
+                raise OSError("Post-read stat failed: file access error")
+            return real_stat(path_obj)
+
+        monkeypatch.setattr(pathlib.Path, "stat", mock_path_stat)
+
+        res = validate_pdf(p)
+
+        assert res.is_valid is False
+        assert res.reason_code == "source_file_unavailable"
+        assert res.content_sha256 is None
+

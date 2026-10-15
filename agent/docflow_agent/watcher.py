@@ -18,6 +18,7 @@ import concurrent.futures
 import logging
 import os
 import pathlib
+import stat
 import threading
 import time
 from collections.abc import Callable
@@ -57,14 +58,19 @@ _IGNORED_EXTENSIONS = frozenset({
 CandidateCallback = Callable[[pathlib.Path], None]
 
 
-def is_candidate_file(path: pathlib.Path | str) -> bool:
+def is_candidate_file(
+    path: pathlib.Path | str,
+    watch_folder: pathlib.Path | str | None = None,
+) -> bool:
     """Determine whether a path is a candidate PDF file for processing.
 
     Rules:
     - Must be a regular file (not directory).
+    - Reject symbolic links and file reparse points.
     - Case-insensitive .pdf extension.
     - Not a temporary file (e.g. .tmp, .crdownload, .part, starting with ~ or .).
     - Must be accessible without fatal OS error.
+    - If watch_folder is specified, resolved path must be within watch_folder at the top level only.
     """
     try:
         p = pathlib.Path(path)
@@ -84,12 +90,38 @@ def is_candidate_file(path: pathlib.Path | str) -> bool:
             if stem_lower.endswith(ext):
                 return False
 
+        # Reject symbolic links
+        if p.is_symlink() or os.path.islink(p):
+            return False
+
+        # Reject file reparse points on Windows
+        try:
+            lstat = os.lstat(p)
+            reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            if bool(getattr(lstat, "st_file_attributes", 0) & reparse_flag):
+                return False
+        except (OSError, AttributeError):
+            return False
+
         # Must be a regular file
         if not p.is_file():
             return False
 
+        # Verify resolution within configured watch folder at the top level only
+        if watch_folder is not None:
+            try:
+                resolved_watch = pathlib.Path(watch_folder).resolve()
+                resolved_p = p.resolve(strict=True)
+            except Exception:
+                # If resolution fails, ignore safely without logging path
+                return False
+
+            if resolved_p.parent != resolved_watch:
+                # Escapes watch folder or is in a subdirectory (not top level)
+                return False
+
         return True
-    except (OSError, PermissionError):
+    except (OSError, PermissionError, RuntimeError, ValueError):
         return False
 
 
@@ -118,10 +150,10 @@ class _WatchdogHandler(FileSystemEventHandler):
     def _handle_path(self, path_str: str) -> None:
         try:
             path = pathlib.Path(path_str)
-            if is_candidate_file(path):
+            if self._watcher.is_candidate(path):
                 self._watcher.schedule_candidate(path)
-        except Exception as exc:
-            logger.debug("Error inspecting event path: %s", type(exc).__name__)
+        except Exception:
+            logger.debug("Error inspecting event path")
 
 
 class Watcher:
@@ -161,9 +193,16 @@ class Watcher:
         self._running = False
         self._rescan_thread: threading.Thread | None = None
 
+    def is_candidate(self, path: pathlib.Path | str) -> bool:
+        """Check whether path is a valid candidate strictly within this watcher's folder."""
+        return is_candidate_file(path, watch_folder=self.watch_folder)
+
     def is_active(self, path: pathlib.Path | str) -> bool:
         """Check if a path is currently being processed by a worker."""
-        key = str(pathlib.Path(path).resolve())
+        try:
+            key = str(pathlib.Path(path).resolve())
+        except Exception:
+            return False
         with self._lock:
             return key in self._active_paths
 
@@ -174,7 +213,13 @@ class Watcher:
             True if scheduled, False if already in-progress (deduplicated).
         """
         p = pathlib.Path(path)
-        key = str(p.resolve())
+        if not self.is_candidate(p):
+            return False
+
+        try:
+            key = str(p.resolve(strict=True))
+        except Exception:
+            return False
 
         with self._lock:
             if not self._running and self._observer.is_alive():
@@ -210,7 +255,7 @@ class Watcher:
 
         try:
             for item in self.watch_folder.iterdir():
-                if is_candidate_file(item):
+                if self.is_candidate(item):
                     candidates.append(item)
                     self.schedule_candidate(item)
         except (OSError, PermissionError) as exc:
@@ -285,6 +330,7 @@ class Watcher:
 def process_candidate_file(
     path: pathlib.Path | str,
     *,
+    watch_folder: pathlib.Path | str | None = None,
     quarantine_folder: pathlib.Path | str | None = None,
     max_size_bytes: int = DEFAULT_MAX_PDF_SIZE_BYTES,
     default_region: str = "IN",
@@ -298,6 +344,7 @@ def process_candidate_file(
 
     Args:
         path: Candidate PDF path.
+        watch_folder: Optional watch folder to enforce top-level boundary.
         quarantine_folder: Directory to quarantine permanently invalid files.
         max_size_bytes: Configured maximum PDF size.
         default_region: Region code for phone number validation.
@@ -311,6 +358,14 @@ def process_candidate_file(
         tuple of (StabilityResult, ValidationResult | None, QuarantineResult | None).
     """
     file_path = pathlib.Path(path)
+
+    # 0. Candidate and boundary check (do not quarantine boundary failures)
+    if not is_candidate_file(file_path, watch_folder=watch_folder):
+        return (
+            StabilityResult(is_stable=False, reason_code="outside_watch_folder"),
+            None,
+            None,
+        )
 
     # 1. Stability check
     stab = check_stability(
