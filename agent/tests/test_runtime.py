@@ -1,0 +1,313 @@
+"""
+Tests for Agent Runtime Orchestrator, Retry Policy, and Lifecycle Management.
+
+Covers:
+- Startup recovery (expired worker lease reclamation and folder rescan).
+- Single-worker lease claiming (BEGIN IMMEDIATE) and release.
+- Successful registration processing and state progression.
+- Transient failure handling with exponential backoff and retry scheduling.
+- Retry budget exhaustion transitioning jobs to terminal FAILED.
+- Device revocation (403) pausing active network operations.
+- Graceful shutdown releasing all active worker leases.
+- Deterministic run_once() sweep execution.
+"""
+
+from __future__ import annotations
+
+import datetime
+from datetime import timedelta, timezone
+import json
+import pathlib
+import uuid
+import pytest
+import httpx
+
+from docflow_agent.client import ApiClient
+from docflow_agent.config import AgentConfig
+from docflow_agent.credentials import InMemoryCredentialStore
+from docflow_agent.pdf import ValidationResult
+from docflow_agent.queue import JobQueue, JobStatus
+from docflow_agent.runtime import (
+    AgentRuntime,
+    calculate_backoff_delay,
+)
+from docflow_agent.service import ServiceRunner
+from docflow_agent.token_manager import TokenManager
+
+
+@pytest.fixture
+def temp_env(tmp_path: pathlib.Path):
+    watch = tmp_path / "watch"
+    archive = tmp_path / "archive"
+    quarantine = tmp_path / "quarantine"
+    watch.mkdir()
+    archive.mkdir()
+    quarantine.mkdir()
+
+    config = AgentConfig(
+        api_base_url="https://api.docflow.test",
+        watch_folder=str(watch),
+        archive_folder=str(archive),
+        quarantine_folder=str(quarantine),
+        db_path=str(tmp_path / "agent.db"),
+        phone_default_region="IN",
+        stability_sample_seconds=1,
+        stability_required_samples=2,
+        stability_timeout_seconds=10,
+        max_pdf_size_bytes=52428800,
+        cleanup_retention_hours=24,
+        failed_retention_days=14,
+        temp_upload_expected_host="tmpfiles.org",
+        temp_upload_ttl_seconds=3600,
+        temp_upload_expiry_buffer_seconds=300,
+        log_level="INFO",
+    )
+    store = InMemoryCredentialStore()
+    store.store("device_refresh_token", "test-refresh-token")
+    return config, store, watch
+
+
+def _make_client(handler, token: str = "valid-token") -> ApiClient:
+    return ApiClient(
+        base_url="https://api.docflow.test",
+        token_provider=lambda: token,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+
+class TestBackoffCalculation:
+    def test_calculate_backoff_delay_exponential(self):
+        d1 = calculate_backoff_delay(1, base_seconds=2.0, multiplier=2.0, jitter=False)
+        d2 = calculate_backoff_delay(2, base_seconds=2.0, multiplier=2.0, jitter=False)
+        d3 = calculate_backoff_delay(3, base_seconds=2.0, multiplier=2.0, jitter=False)
+
+        assert d1 == 2.0
+        assert d2 == 4.0
+        assert d3 == 8.0
+
+    def test_calculate_backoff_delay_capped(self):
+        d = calculate_backoff_delay(20, base_seconds=2.0, max_seconds=100.0, jitter=False)
+        assert d == 100.0
+
+    def test_calculate_backoff_delay_with_jitter(self):
+        d = calculate_backoff_delay(2, base_seconds=2.0, jitter=True)
+        # Should be between 0.5 * 4.0 and 4.0
+        assert 2.0 <= d <= 4.0
+
+
+class TestAgentRuntime:
+    def test_startup_recovery(self, temp_env):
+        config, store, watch = temp_env
+        queue = JobQueue.from_config(config)
+
+        # Create an expired worker lease
+        pdf = watch / "919876543210.pdf"
+        pdf.write_bytes(b"%PDF-1.4 sample")
+        val = ValidationResult(
+            is_valid=True,
+            source_path=pdf,
+            source_basename="919876543210.pdf",
+            recipient_phone_e164="+919876543210",
+            content_sha256="1" * 64,
+            file_size_bytes=100,
+            mtime_ns=100,
+        )
+        enq = queue.enqueue(val, branch_id=str(uuid.uuid4()))
+        past_time = (datetime.datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        with queue._write_transaction() as conn:
+            conn.execute(
+                "UPDATE jobs SET lease_owner = 'dead-worker', lease_expires_at = ? WHERE id = ?;",
+                (past_time, enq.job.id),
+            )
+
+        client = _make_client(lambda r: httpx.Response(200))
+        runtime = AgentRuntime(config, credential_store=store, queue=queue, client=client)
+
+        recovery = runtime.startup_recovery()
+        assert recovery["recovered_leases"] == 1
+
+        recovered_job = queue.get_job(enq.job.id)
+        assert recovered_job.lease_owner is None
+        assert recovered_job.lease_expires_at is None
+
+    def test_process_next_registration_job_success(self, temp_env):
+        config, store, watch = temp_env
+        queue = JobQueue.from_config(config)
+
+        pdf = watch / "919876543210.pdf"
+        pdf.write_bytes(b"%PDF-1.4 sample")
+        val = ValidationResult(
+            is_valid=True,
+            source_path=pdf,
+            source_basename="919876543210.pdf",
+            recipient_phone_e164="+919876543210",
+            content_sha256="2" * 64,
+            file_size_bytes=100,
+            mtime_ns=100,
+        )
+        enq = queue.enqueue(val, branch_id=str(uuid.uuid4()))
+        server_report_id = str(uuid.uuid4())
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                202,
+                json={
+                    "report_id": server_report_id,
+                    "status": "queued",
+                    "duplicate": False,
+                    "created_at": "2026-10-15T12:00:00Z",
+                },
+            )
+
+        client = _make_client(handler)
+        runtime = AgentRuntime(config, credential_store=store, queue=queue, client=client)
+
+        processed = runtime.process_next_registration_job()
+        assert processed is True
+
+        updated = queue.get_job(enq.job.id)
+        assert updated.status == JobStatus.METADATA_REGISTERED.value
+        assert updated.docflow_report_id == server_report_id
+        # Lease must be cleanly released!
+        assert updated.lease_owner is None
+
+    def test_process_next_registration_job_transient_error_schedules_backoff(self, temp_env):
+        config, store, watch = temp_env
+        queue = JobQueue.from_config(config)
+
+        pdf = watch / "919876543210.pdf"
+        pdf.write_bytes(b"%PDF-1.4 sample")
+        val = ValidationResult(
+            is_valid=True,
+            source_path=pdf,
+            source_basename="919876543210.pdf",
+            recipient_phone_e164="+919876543210",
+            content_sha256="3" * 64,
+            file_size_bytes=100,
+            mtime_ns=100,
+        )
+        enq = queue.enqueue(val, branch_id=str(uuid.uuid4()))
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("Timeout")
+
+        client = _make_client(handler)
+        runtime = AgentRuntime(config, credential_store=store, queue=queue, client=client)
+
+        processed = runtime.process_next_registration_job()
+        assert processed is False
+
+        updated = queue.get_job(enq.job.id)
+        assert updated.status == JobStatus.RETRY_WAIT.value
+        assert updated.attempt_count == 1
+        assert updated.next_attempt_at is not None
+        assert updated.lease_owner is None
+
+    def test_process_next_registration_job_retry_budget_exhaustion(self, temp_env):
+        config, store, watch = temp_env
+        queue = JobQueue.from_config(config)
+
+        pdf = watch / "919876543210.pdf"
+        pdf.write_bytes(b"%PDF-1.4 sample")
+        val = ValidationResult(
+            is_valid=True,
+            source_path=pdf,
+            source_basename="919876543210.pdf",
+            recipient_phone_e164="+919876543210",
+            content_sha256="4" * 64,
+            file_size_bytes=100,
+            mtime_ns=100,
+        )
+        enq = queue.enqueue(val, branch_id=str(uuid.uuid4()))
+        # Simulate 2 prior attempts, with max_retry_attempts=3
+        with queue._write_transaction() as conn:
+            conn.execute("UPDATE jobs SET attempt_count = 2 WHERE id = ?;", (enq.job.id,))
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("Timeout")
+
+        client = _make_client(handler)
+        runtime = AgentRuntime(
+            config,
+            credential_store=store,
+            queue=queue,
+            client=client,
+            max_retry_attempts=3,
+        )
+
+        processed = runtime.process_next_registration_job()
+        assert processed is False
+
+        updated = queue.get_job(enq.job.id)
+        # Attempt count reached 3 -> marked FAILED
+        assert updated.status == JobStatus.FAILED.value
+        assert updated.last_error_code == "retry_budget_exhausted"
+
+    def test_runtime_pause_on_device_revocation(self, temp_env):
+        config, store, watch = temp_env
+        queue = JobQueue.from_config(config)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                403,
+                json={
+                    "type": "about:blank",
+                    "title": "Forbidden",
+                    "status": 403,
+                    "code": "permission_denied",
+                    "detail": "Device is revoked.",
+                },
+            )
+
+        client = _make_client(handler)
+        runtime = AgentRuntime(config, credential_store=store, queue=queue, client=client)
+
+        assert runtime.is_paused is False
+        runtime.run_once()
+        assert runtime.is_paused is True
+
+    def test_runtime_shutdown_releases_active_leases(self, temp_env):
+        config, store, watch = temp_env
+        queue = JobQueue.from_config(config)
+
+        pdf = watch / "919876543210.pdf"
+        pdf.write_bytes(b"%PDF-1.4 sample")
+        val = ValidationResult(
+            is_valid=True,
+            source_path=pdf,
+            source_basename="919876543210.pdf",
+            recipient_phone_e164="+919876543210",
+            content_sha256="5" * 64,
+            file_size_bytes=100,
+            mtime_ns=100,
+        )
+        enq = queue.enqueue(val, branch_id=str(uuid.uuid4()))
+
+        claimed = queue.claim_job("test-worker")
+        assert claimed is not None
+
+        client = _make_client(lambda r: httpx.Response(200))
+        runtime = AgentRuntime(
+            config,
+            credential_store=store,
+            queue=queue,
+            client=client,
+            worker_id="test-worker",
+        )
+        runtime._active_leases.add(enq.job.id)
+
+        runtime.shutdown()
+        released_job = queue.get_job(enq.job.id)
+        assert released_job.lease_owner is None
+        assert released_job.lease_expires_at is None
+
+
+class TestServiceRunner:
+    def test_service_runner_stops_gracefully(self, temp_env):
+        config, store, watch = temp_env
+        runner = ServiceRunner(config=config, poll_interval_seconds=0.1)
+
+        # Trigger stop immediately
+        runner.stop()
+        exit_code = runner.run()
+        assert exit_code == 0

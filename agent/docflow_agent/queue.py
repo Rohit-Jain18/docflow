@@ -802,6 +802,38 @@ class JobQueue:
 
             return [self._row_to_job(row) for row in cur.fetchall() if row is not None]  # type: ignore[misc]
 
+    def get_queue_counts(self) -> dict[str, int]:
+        """Return counts of queued, retry_wait, and quarantined jobs for heartbeat telemetry."""
+        with self._read_connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN status IN ('validated', 'metadata_registering', 'metadata_registered', 'uploading', 'media_uploaded', 'media_reference_attaching', 'registered') THEN 1 ELSE 0 END) AS queued,
+                    SUM(CASE WHEN status = 'retry_wait' THEN 1 ELSE 0 END) AS retry_wait,
+                    SUM(CASE WHEN status = 'quarantined' THEN 1 ELSE 0 END) AS quarantined
+                FROM jobs;
+                """
+            )
+            row = cur.fetchone()
+            return {
+                "queued": int(row["queued"] or 0) if row else 0,
+                "retry_wait": int(row["retry_wait"] or 0) if row else 0,
+                "quarantined": int(row["quarantined"] or 0) if row else 0,
+            }
+
+    def get_last_successful_job_at(self) -> str | None:
+        """Return the timestamp of the most recent successful job (accepted/delivered/read)."""
+        with self._read_connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT MAX(COALESCE(accepted_at, terminal_confirmed_at)) AS last_success
+                FROM jobs
+                WHERE status IN ('accepted', 'delivered', 'read');
+                """
+            )
+            row = cur.fetchone()
+            return str(row["last_success"]) if row and row["last_success"] else None
+
     # -----------------------------------------------------------------------
     # State Transitions & Lifecycle Updates
     # -----------------------------------------------------------------------
@@ -1189,6 +1221,67 @@ class JobQueue:
             if updated_job is None:
                 raise QueueStateError(f"Failed to fetch updated job '{job_id}'.")
             return updated_job
+
+    def get_cleanup_candidates(
+        self,
+        now_iso: str | None = None,
+        limit: int = 50,
+    ) -> list[JobRecord]:
+        """Fetch jobs eligible for source PDF cleanup verification."""
+        current_time = now_iso or datetime.now(timezone.utc).isoformat()
+        bounded_limit = max(1, min(limit, 500))
+
+        with self._read_connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE status IN ('delivered', 'read', 'failed', 'quarantined')
+                  AND cleanup_status IN ('retention_active', 'eligible_for_deletion')
+                  AND operator_hold = 0
+                  AND cleanup_eligible_at IS NOT NULL
+                  AND cleanup_eligible_at <= ?
+                  AND (lease_owner IS NULL OR lease_expires_at <= ?)
+                ORDER BY cleanup_eligible_at ASC
+                LIMIT ?;
+                """,
+                (current_time, current_time, bounded_limit),
+            )
+            return [self._row_to_job(r) for r in cur.fetchall() if r is not None]  # type: ignore[misc]
+
+    def mark_source_deleted(
+        self,
+        job_id: str,
+        deletion_verified_at: str | None = None,
+    ) -> JobRecord:
+        """Atomically record verified best-effort source PDF deletion in SQLite."""
+        now_iso = deletion_verified_at or datetime.now(timezone.utc).isoformat()
+
+        with self._write_transaction() as conn:
+            cur = conn.execute(
+                """
+                UPDATE jobs
+                SET cleanup_status = 'deleted',
+                    deletion_verified_at = ?,
+                    updated_at = ?
+                WHERE id = ?;
+                """,
+                (now_iso, now_iso, job_id),
+            )
+            if cur.rowcount == 0:
+                raise JobNotFoundError(f"Job '{job_id}' not found.")
+
+            self._append_event_conn(
+                conn,
+                job_id=job_id,
+                event_type="source_file_deleted",
+                safe_details={"cleanup_status": "deleted"},
+            )
+
+            cur_job = conn.execute("SELECT * FROM jobs WHERE id = ?;", (job_id,))
+            updated = self._row_to_job(cur_job.fetchone())
+            if updated is None:
+                raise QueueStateError(f"Failed to fetch updated job '{job_id}'.")
+            return updated
 
     # -----------------------------------------------------------------------
     # Job Events

@@ -133,3 +133,31 @@ class TestCLINoCommand:
     def test_no_command_shows_help(self, capsys: pytest.CaptureFixture[str]) -> None:
         exit_code = main([])
         assert exit_code == 1
+
+
+class TestCLIRun:
+    """Test the 'run' CLI command."""
+
+    def test_run_once(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        archive = tmp_path / "archive"
+        quarantine = tmp_path / "quarantine"
+        toml_content = textwrap.dedent(f"""\
+            [agent]
+            api_base_url = "http://localhost:8000"
+            watch_folder = "{watch.as_posix()}"
+            archive_folder = "{archive.as_posix()}"
+            quarantine_folder = "{quarantine.as_posix()}"
+            db_path = "{(tmp_path / 'cli_run.db').as_posix()}"
+        """)
+        config_file = tmp_path / "agent.toml"
+        config_file.write_text(toml_content, encoding="utf-8")
+        monkeypatch.setenv("DOCFLOW_AGENT_CONFIG_FILE", str(config_file))
+
+        exit_code = main(["run", "--once"])
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        assert "Sweep complete:" in captured.out

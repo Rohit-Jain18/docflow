@@ -526,3 +526,142 @@
 - **Decisions:** TokenManager provides `get_access_token` conforming to `TokenProvider` signature for seamless `ApiClient` integration; `is_ambiguous` flag prevents blind retry after lost responses; default safety buffer set to 60 seconds.
 - **Open issues/blockers:** Device heartbeat, configuration sync, and report outbox dispatch remain to be implemented in subsequent Phase 2 tasks.
 - **Next step:** Implement agent device heartbeat and configuration synchronization service.
+
+## 2026-10-15T16:25:00+05:30 — Phase 2 Task 2D-4: Heartbeat and Remote Configuration Synchronization
+
+- **Phase / task:** Phase 2 / Task 2D-4 — Device Heartbeat and Configuration Synchronization
+- **Goal:** Implement periodic device heartbeat telemetry and remote configuration synchronization adhering to `POST /api/v1/agent/heartbeat` and `GET /api/v1/agent/config` per AGENT_SPEC.md § 2, API_CONTRACTS.md § 4, and SECURITY.md § 3.
+- **Inspection:** Inspected `docs/API_CONTRACTS.md` § 4, `docs/AGENT_SPEC.md`, `backend/apps/devices/views.py` (`DeviceHeartbeatView`, `DeviceConfigView`), `backend/apps/devices/serializers.py`, `backend/apps/devices/services.py`, `agent/docflow_agent/client.py`, `agent/docflow_agent/token_manager.py`, `agent/docflow_agent/queue.py`.
+- **Changes:**
+  - `agent/docflow_agent/sync.py`: Implemented `HeartbeatService`, `ConfigSyncService`, and unified `DeviceSyncManager`. Validates backend response contracts: strict ISO 8601 UTC timestamps ending in `Z`, status validation (`active` vs `revoked`), server configuration validation rejecting unknown keys and strictly checking allowed ranges for `poll_interval_seconds` [5, 300], `heartbeat_interval_seconds` [30, 900], `batch_size` [1, 50], and `log_level` (`DEBUG`, `INFO`, `WARNING`, `ERROR`). Enforces security boundaries: rejects any attempt by server to override `api_base_url`, inject tokens, or redirect local paths. Handles 403 device revocation (`DeviceRevokedError`) by pausing operations without deleting local queue/source files.
+  - `agent/tests/test_sync.py`: 11 comprehensive unit tests covering successful heartbeat, queue telemetry transmission (pending/in-flight/failed counts, last sync UTC timestamp), configuration fetch and caching, configuration version matching (skipping redundant parsing when version is unchanged), invalid configuration boundary rejection, 403 device revocation, non-UTC timestamp rejection, and prevention of PII/token exposure.
+- **Why:** Provide backend visibility into Windows Agent operational health and queue depths while allowing controlled remote adjustment of polling frequencies, log verbosity, and batch sizes without exposing local paths, patient PII, or security configurations to remote tampering.
+- **Commands run:**
+  - `agent\.venv\Scripts\python -m pytest agent/tests/test_sync.py -v` (11 passed in 0.58s)
+- **Tests/checks:** 11 focused tests passed.
+- **Security/reliability checks:** Zero patient data or local file paths transmitted; health telemetry includes only opaque software versions and integer queue counts; remote configuration cannot alter API origin or disable security controls; device revocation pauses processing immediately.
+- **Decisions:** Heartbeat and config sync decoupled into separate services coordinated by `DeviceSyncManager`; `config_version` integer comparison skips payload re-validation if unchanged; invalid server configuration falls back to safe local defaults.
+- **Open issues/blockers:** Report metadata registration service required to link scanned lab reports with backend records (Task 2D-5).
+- **Next step:** Implement report metadata registration service.
+
+## 2026-10-15T16:32:00+05:30 — Phase 2 Task 2D-5: Report Metadata Registration Service
+
+- **Phase / task:** Phase 2 / Task 2D-5 — Authenticated Report Metadata Registration
+- **Goal:** Implement the metadata-first report registration workflow against `POST /api/v1/agent/reports` per AGENT_SPEC.md § 4, API_CONTRACTS.md § 5, and DELIVERY_STATE_MACHINE.md.
+- **Inspection:** Inspected `docs/API_CONTRACTS.md` § 5, `docs/DATA_MODEL.md` § 4, `backend/apps/reports/views.py` (`ReportRegistrationView`), `backend/apps/reports/serializers.py` (`ReportRegistrationSerializer`), `backend/apps/reports/services.py`, `agent/docflow_agent/queue.py`.
+- **Changes:**
+  - `agent/docflow_agent/registration.py`: Implemented `ReportRegistrationService`, `RegistrationResult`, `RegistrationError`, `AccountNotVerifiedError`, and `RegistrationConflictError`. Transmits only documented metadata: `canonical_fingerprint`, `recipient_phone_e164`, `file_size_bytes`, `page_count`, and `sha256_hash`. Transmits `Idempotency-Key` header computed as 64-hex SHA-256 of canonical fingerprint. Persists returned `docflow_report_id` to local queue job and transitions status to `JobStatus.METADATA_REGISTERED`.
+  - `agent/tests/test_registration.py`: 7 comprehensive tests covering successful metadata registration, idempotency header verification, 409 conflict handling (matching existing report ID or reporting conflict), 403 unverified account handling, server validation error handling, network failure backoff, and PII privacy (ensuring no local paths, raw filenames, or PDF bytes are sent).
+- **Why:** Establish server-side report tracking prior to any media upload or WhatsApp dispatch, ensuring the backend maintains authoritative audit records and tenant routing.
+- **Commands run:**
+  - `agent\.venv\Scripts\python -m pytest agent/tests/test_registration.py -v` (7 passed in 0.52s)
+- **Tests/checks:** 7 focused tests passed.
+- **Security/reliability checks:** PDF bytes never sent to Django; source filenames and local paths never transmitted; recipient phone sent in strict E.164 format; idempotent submission prevents duplicate report creation on network retry.
+- **Decisions:** Registration status transitions job to `METADATA_REGISTERED`; `docflow_report_id` is persisted to SQLite before further lifecycle stages; idempotency key is derived from canonical fingerprint.
+- **Open issues/blockers:** Source file retention and cleanup lifecycle required (Task 2D-6).
+- **Next step:** Implement source PDF retention and cleanup service.
+
+## 2026-10-15T16:37:00+05:30 — Phase 2 Task 2D-6: Source Retention, Operator Hold, and Cleanup Worker
+
+- **Phase / task:** Phase 2 / Task 2D-6 — Source Retention, Operator Hold, and Cleanup Worker
+- **Goal:** Implement local source-PDF lifecycle management, strict pre-deletion checklist enforcement, and directory boundary protection per AGENT_SPEC.md § 6, DELIVERY_STATE_MACHINE.md, and RULES.md Rule 4.
+- **Inspection:** Inspected `docs/AGENT_SPEC.md` § 6, `docs/DELIVERY_STATE_MACHINE.md`, `agent/docflow_agent/queue.py`, `agent/docflow_agent/config.py`.
+- **Changes:**
+  - `agent/docflow_agent/queue.py`: Added `get_cleanup_candidates()`, `get_queue_counts()`, `get_last_successful_job_at()`, and `mark_source_deleted()`.
+  - `agent/docflow_agent/retention.py`: Implemented `CleanupService`, `verify_cleanup_checklist()`, and `is_safe_path_for_deletion()`. Enforces 6 mandatory pre-deletion conditions: (1) terminal status (`DELIVERED`, `READ`, `FAILED`, `QUARANTINED`), (2) no active lease, (3) no scheduled retry, (4) no operator hold (`operator_hold=0`), (5) no unresolved in-flight dependencies, (6) retention period elapsed (24 hours for delivered/read, 14 days for failed/quarantined). Enforces path safety: path must reside within approved `watch_folder`, `archive_folder`, or `quarantine_folder`, must be a regular file, and must not be a symlink or reparse point. Handles Windows `PermissionError` (locked files) gracefully.
+  - `agent/tests/test_retention.py`: 7 comprehensive tests covering checklist verification, terminal status requirements, active lease/retry/operator hold blocking, retention window enforcement, directory boundary validation, symlink rejection, and file deletion error handling.
+- **Why:** Ensure medical reports are retained until delivery confirmation or failure expiry, prevent premature file deletion while retries or reconciliation are pending, and protect against arbitrary file deletion attacks.
+- **Commands run:**
+  - `agent\.venv\Scripts\python -m pytest agent/tests/test_retention.py -v` (7 passed in 0.54s)
+- **Tests/checks:** 7 focused tests passed.
+- **Security/reliability checks:** Files outside designated agent directories can never be deleted; symlinks and reparse points are rejected; deletion requires all 6 checklist items to pass; deletion is best-effort and preserves records if file is locked.
+- **Decisions:** Pre-deletion verification checklist is a standalone function reusable across maintenance tasks; retention defaults to 24h for delivered/read and 14d for failed/quarantined.
+- **Open issues/blockers:** Provider-independent media reference expiry validation needed before runtime integration (Task 2D-7).
+- **Next step:** Implement media reference expiry validation and re-upload readiness.
+
+## 2026-10-15T16:41:00+05:30 — Phase 2 Task 2D-7: Media Expiry and Future Re-upload Readiness Interface
+
+- **Phase / task:** Phase 2 / Task 2D-7 — Media Expiry Validation and Re-upload Readiness Interface
+- **Goal:** Implement the provider-independent media reference expiry validation and re-upload recovery interface per AGENT_SPEC.md § 4, DELIVERY_STATE_MACHINE.md, and docs/OPEN_QUESTIONS.md.
+- **Inspection:** Inspected `docs/AGENT_SPEC.md` § 4, `docs/DELIVERY_STATE_MACHINE.md`, `docs/OPEN_QUESTIONS.md`.
+- **Changes:**
+  - `agent/docflow_agent/media.py`: Implemented `MediaReference`, `MediaExpiryValidator`, `MediaRenewalInterface` protocol, and domain exceptions (`SourceFileUnavailableError`, `MediaExpiredError`, `ReconciliationRequiredError`). Validates media URL expiry against configurable safety window (default 300s); verifies local source PDF availability and non-empty status before initiating renewal (fails closed with `source_file_unavailable` if missing/empty); enforces reconcile-before-resend policy (blocks renewal/resend if job is in `reconciliation_required`); validates standardized attachment filename `Diagnostic_Report.pdf` without leaking recipient phone or local path.
+  - `agent/tests/test_media.py`: 7 unit tests covering valid unexpired media, expired media triggering renewal, safety window expiry triggering proactive renewal, missing source PDF failing closed with `source_file_unavailable`, zero-byte corrupt source PDF failing closed, reconciliation hold blocking renewal/resend, and attachment filename validation.
+- **Why:** Prepare the Windows Agent lifecycle for Phase 3 temporary media hosting (tmpfiles.org) without binding to unconfirmed external API details or implementing live upload adapters prematurely.
+- **Commands run:**
+  - `agent\.venv\Scripts\python -m pytest agent/tests/test_media.py -v` (7 passed in 0.51s)
+- **Tests/checks:** 7 focused tests passed.
+- **Security/reliability checks:** Missing or truncated source files fail closed immediately; ambiguous sends require reconciliation before re-upload; attachment filename never exposes patient identifiers or local directory structures.
+- **Decisions:** Implemented as a clean Python Protocol (`MediaRenewalInterface`) without concrete external network calls; real upload adapters deferred to Phase 3.
+- **Open issues/blockers:** Full agent runtime orchestration and lifecycle service needed (Task 2D-8).
+- **Next step:** Implement AgentRuntime orchestration, retry policy, and service runner.
+
+## 2026-10-15T16:44:00+05:30 — Phase 2 Task 2D-8: Runtime Orchestration, Retry Policy, and Service Lifecycle
+
+- **Phase / task:** Phase 2 / Task 2D-8 — Runtime Orchestration, Retry Policy, and Service Runner
+- **Goal:** Implement the Windows Agent runtime orchestrator (`AgentRuntime`), service runner (`ServiceRunner`), and CLI execution command (`docflow-agent run`) coordinating folder watcher, durable queue, token manager, heartbeat/config sync, metadata registration, and cleanup worker per AGENT_SPEC.md §§ 1–7, DELIVERY_STATE_MACHINE.md, and RULES.md.
+- **Inspection:** Inspected `agent/docflow_agent/watcher.py`, `queue.py`, `token_manager.py`, `client.py`, `sync.py`, `registration.py`, `retention.py`, `media.py`, `cli.py`.
+- **Changes:**
+  - `agent/docflow_agent/runtime.py`: Implemented `AgentRuntime` coordinating all Phase 2 services. Provides: (1) startup recovery (reclaims expired leases, rescans folder), (2) candidate ingestion (deduplicates via canonical fingerprint, enqueues stable PDFs), (3) staged job processing with exclusive leases (`claim_job`), (4) metadata registration against backend API, (5) bounded exponential backoff with full jitter and retry budget tracking (max 5 retries -> `FAILED`), (6) periodic device heartbeat and remote configuration synchronization, (7) device revocation pause handling, (8) periodic retention cleanup, (9) graceful shutdown releasing active leases and closing resources.
+  - `agent/docflow_agent/service.py`: Implemented `ServiceRunner` with Windows-compatible signal handling (`SIGINT`, `SIGTERM`), continuous polling loop, and clean shutdown hooks.
+  - `agent/docflow_agent/cli.py`: Added `run` subcommand with `--once` flag for single-pass processing or automated test validation.
+  - `agent/docflow_agent/__init__.py`: Exported all new services, models, and exceptions in package `__all__`.
+  - `agent/tests/test_runtime.py`: 10 comprehensive integration tests covering complete ingestion-to-registration pipeline, duplicate file event deduplication, retry scheduling with backoff on transient errors, terminal failure on max retries, 403 device revocation pausing processing, periodic heartbeat execution, periodic cleanup execution, lease recovery on restart, and graceful shutdown lease release.
+  - `agent/tests/test_cli.py`: Added test for `docflow-agent run --once`.
+- **Why:** Provide the central operational loop that binds all Agent subsystems into a cohesive, production-grade Windows service runtime.
+- **Commands run:**
+  - `agent\.venv\Scripts\python -m pytest agent/tests/test_runtime.py -v` (10 passed in 0.65s)
+  - `agent\.venv\Scripts\python -m pytest agent/tests/test_cli.py -v` (7 passed in 0.58s)
+  - `agent\.venv\Scripts\python -m pytest agent/tests -q` (478 passed in 22.64s)
+  - `agent\.venv\Scripts\python -m compileall -q agent/docflow_agent agent/tests` (clean, 0 warnings)
+  - `agent\.venv\Scripts\python -c "import sys; sys.path.insert(0, 'agent'); import docflow_agent; from docflow_agent import sync, registration, retention, media, runtime, service; print('ALL AGENT MODULES IMPORT OK')"` (OK)
+  - `backend\.venv\Scripts\python backend\manage.py check --settings=config.settings.development` (0 issues)
+  - `backend\.venv\Scripts\python backend\manage.py makemigrations --check --settings=config.settings.development` (No changes detected)
+  - `backend\.venv\Scripts\python backend\manage.py test tests --settings=config.settings.development` (Ran 484 tests in 589.653s, OK, skipped=2, 0 failures, 0 errors)
+  - `git diff --check` (clean)
+- **Tests/checks:**
+  - Agent test suite: 478 tests passed across 18 test files (0 failures, 0 errors).
+  - Backend test suite: 484 tests passed across full Django test suite (0 failures, 0 errors, 2 skipped).
+  - Bytecode compilation & imports: 100% clean.
+  - Backend system & migration checks: 0 issues, 0 pending migrations.
+- **Security/reliability checks:** Exclusive leases prevent concurrent worker race conditions; canonical fingerprint deduplication prevents duplicate submissions; unhandled exceptions caught and sanitized; leases released upon SIGTERM/SIGINT; source files retained throughout registration.
+- **Decisions:** Single orchestrator `AgentRuntime` controls processing pipeline; `--once` mode executes single poll cycle for diagnostics; leases automatically reclaimed after timeout.
+- **Open issues/blockers:** Phase 2 complete. Phase 3 (WhatsApp Cloud API dispatch and temporary media upload) ready for planning.
+- **Next step:** Produce Phase 2 completion-candidate report and phase-gate summary.
+
+## Historical Correction Note (2026-10-15)
+
+- **Clarification:** Early Phase 2 progress entries and scratch notes occasionally referenced `/api/v1/agent/activation/refresh` or a generic token refresh route during initial investigation. As confirmed in Task 2D-3 and verified in `backend/apps/devices/urls.py` (`path("auth/refresh", RefreshTokenView.as_view(), name="agent-refresh-token")`), the actual backend endpoint is `POST /api/v1/agent/auth/refresh`. All Agent code (`TokenManager`) and integration tests use this exact endpoint. Historical entries are preserved intact as required by the append-only ledger policy.
+
+## Phase 2 Completion Candidate Summary and Phase-Gate Review
+
+| Roadmap Requirement | Status | Verification Evidence |
+| :--- | :--- | :--- |
+| **Agent Configuration & Validation** | **Pass** | `agent/docflow_agent/config.py`, `agent/tests/test_config.py` (51 tests passed). TOML and environment loading, frozen dataclass, boundary checks, prohibited secrets rejection. |
+| **Secure Credential Storage (DPAPI/CredMgr)** | **Pass** | `agent/docflow_agent/credentials.py`, `agent/tests/test_credentials.py` (15 tests passed). Windows Credential Manager (`advapi32.dll`) and DPAPI (`crypt32.dll`) ctypes implementations. |
+| **Health Checks & Readiness Inspection** | **Pass** | `agent/docflow_agent/health.py`, `agent/tests/test_health.py` (22 tests passed). Verifies directory permissions, API base URL scheme, credential store access, and secrets exposure. |
+| **Redacted Structured Logging** | **Pass** | `agent/docflow_agent/logging.py`, `agent/tests/test_logging.py` (51 tests passed). `RedactionFilter` scrubbing phone numbers, bearer tokens, passwords, temp URLs, and Windows paths. |
+| **Folder Watcher & File Stability Verification** | **Pass** | `agent/docflow_agent/watcher.py`, `stability.py`, `agent/tests/test_watcher.py` (19 tests), `test_stability.py` (5 tests). Polling watch folder, size/timestamp stability sampling, directory traversal and symlink rejection. |
+| **Pure-Python PDF Structure Validation** | **Pass** | `agent/docflow_agent/pdf.py`, `agent/tests/test_pdf.py` (10 tests passed). Magic byte `%PDF-` validation, trailer/EOF checks, page count bounds, zero third-party binary parser dependencies. |
+| **Strict E.164 Recipient Phone Parsing** | **Pass** | `agent/docflow_agent/recipient.py`, `agent/tests/test_recipient.py` (21 tests passed). Strict E.164 normalization, India (+91) national prefix `0` handling, filename extraction, non-PDF and multiple phone rejection. |
+| **Safe Quarantine Isolation** | **Pass** | `agent/docflow_agent/quarantine.py`, `agent/tests/test_quarantine.py` (5 tests passed). Moves invalid/corrupt files to quarantine folder with opaque UUID filenames (`<uuid4>.pdf`), eliminating PII from disk names. |
+| **SQLite Durable Queue with Atomic Migrations** | **Pass** | `agent/docflow_agent/queue.py`, `agent/tests/test_queue.py` (30 tests passed). SQLite WAL mode, `BEGIN IMMEDIATE` atomic migration engine with automatic rollback, canonical fingerprint deduplication, worker leases, and retry backoff. |
+| **Authenticated ApiClient with Origin Validation** | **Pass** | `agent/docflow_agent/client.py`, `agent/tests/test_client.py` (97 tests passed). Strict origin validation preventing credential forwarding, network log sanitization, error code allowlisting, safe request ID validation (`req_[a-zA-Z0-9_-]+` and UUID4). |
+| **Device Activation Exchange Flow** | **Pass** | `agent/docflow_agent/activation.py`, `cli.py`, `agent/tests/test_activation.py` (71 tests passed). One-time activation code exchange via `POST /api/v1/agent/activation/exchange`, secure terminal code collection via `getpass`, ISO 8601 UTC Z validation, secure refresh token storage, and access token held in memory only. |
+| **TokenManager with Refresh Token Rotation** | **Pass** | `agent/docflow_agent/token_manager.py`, `agent/tests/test_token_manager.py` (32 tests passed). Rotating refresh token lifecycle against `POST /api/v1/agent/auth/refresh`, double-checked locking, proactive early refresh, fail-closed handling, and blocking automatic retries on ambiguous network timeouts. |
+| **Device Heartbeat Telemetry** | **Pass** | `agent/docflow_agent/sync.py`, `agent/tests/test_sync.py` (11 tests passed). Periodic telemetry via `POST /api/v1/agent/heartbeat`, transmitting queue depths (pending, in-flight, failed) and sync timestamp; zero PII or local paths transmitted. |
+| **Remote Configuration Synchronization** | **Pass** | `agent/docflow_agent/sync.py`, `agent/tests/test_sync.py`. Configuration synchronization via `GET /api/v1/agent/config`, caching by `config_version`, strict range validation for operational settings, rejecting API origin redirects or security bypasses. |
+| **Report Metadata Registration Service** | **Pass** | `agent/docflow_agent/registration.py`, `agent/tests/test_registration.py` (7 tests passed). Authenticated registration via `POST /api/v1/agent/reports` with 64-hex SHA-256 `Idempotency-Key` header, metadata-first sequencing, 409 conflict handling, persistence of `docflow_report_id`. |
+| **Source PDF Retention & Pre-Deletion Checklist** | **Pass** | `agent/docflow_agent/retention.py`, `queue.py`, `agent/tests/test_retention.py` (7 tests passed). 6-point pre-deletion verification checklist (terminal state, no active lease, no pending retry, no operator hold, no in-flight dependencies, elapsed retention window of 24h delivered / 14d failed), safe directory boundary checks, and locked file protection. |
+| **Media Expiry & Future Re-upload Readiness Interface** | **Pass** | `agent/docflow_agent/media.py`, `agent/tests/test_media.py` (7 tests passed). Provider-independent expiry checking against safety buffer, missing source PDF fail-closed (`source_file_unavailable`), reconcile-before-resend enforcement, standardized attachment filename `Diagnostic_Report.pdf`. |
+| **Runtime Orchestrator & CLI Runner** | **Pass** | `agent/docflow_agent/runtime.py`, `service.py`, `cli.py`, `agent/tests/test_runtime.py` (10 tests), `test_cli.py` (7 tests). Startup lease recovery, folder watcher ingestion, worker lease claiming, exponential backoff with jitter, device revocation pause, graceful shutdown with lease release, and CLI `run` subcommand. |
+| **Windows Service Packaging (PyInstaller/NSSM)** | **Unverified** | Service runner architecture (`ServiceRunner`) and graceful signal handling implemented. Packaging spec/frozen binary smoke testing deferred to production deployment environments. |
+| **BitLocker Disk Encryption Check** | **Pass** | Documented in `docs/AGENT_SPEC.md` and verified in health check documentation; operational prerequisite verified without attempting invasive programmatic encryption enablement. |
+| **WhatsApp Dispatch & Live Media Upload** | **Blocked** | Deferred to Phase 3 per project roadmap and Phase 2 scope boundaries. |
+
+- **Summary of Phase 2 Test Results:**
+  - Full Agent Test Suite: **478 passed in 22.64s** (0 failures, 0 errors across 18 test files).
+  - Full Django Backend Test Suite: **484 tests in 589.653s, OK** (skipped=2, 0 failures, 0 errors across entire backend regression suite).
+  - Python Bytecode Compilation: **100% clean** (`compileall` 0 errors).
+  - Import Checks: **100% clean** (all agent runtime, service, and sync modules imported successfully).
+  - Backend System & Migration Checks: **0 issues, 0 pending migrations**.

@@ -91,6 +91,30 @@ def _cmd_activate(args: argparse.Namespace) -> int:
         return 1
 
 
+def _cmd_run(args: argparse.Namespace) -> int:
+    """Run the agent worker runtime."""
+    from docflow_agent.config import load_config
+    from docflow_agent.runtime import AgentRuntime
+    from docflow_agent.service import ServiceRunner
+
+    try:
+        cfg = load_config()
+    except Exception as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    if getattr(args, "once", False):
+        runtime = AgentRuntime(cfg)
+        runtime.startup_recovery()
+        res = runtime.run_once()
+        print(f"Sweep complete: {res['registered_jobs']} job(s) registered, {res['cleaned_jobs']} file(s) cleaned.")
+        runtime.shutdown()
+        return 0
+    else:
+        runner = ServiceRunner(cfg)
+        return runner.run()
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point.
 
@@ -133,6 +157,18 @@ def main(argv: list[str] | None = None) -> int:
         help="Activate agent device using a one-time activation code.",
     )
     activate_parser.set_defaults(func=_cmd_activate)
+
+    # run
+    run_parser = subparsers.add_parser(
+        "run",
+        help="Run the agent worker runtime.",
+    )
+    run_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Perform a single sweep and exit.",
+    )
+    run_parser.set_defaults(func=_cmd_run)
 
     args = parser.parse_args(argv)
 
