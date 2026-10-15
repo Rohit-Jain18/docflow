@@ -792,3 +792,142 @@ class TestLogAndExceptionSanitization:
         assert fake_secret not in repr(err)
         assert fake_patient not in str(err)
         assert fake_patient not in repr(err)
+
+    @pytest.mark.parametrize(
+        ("status_code", "raw_code", "expected_fallback_code", "expected_exc_type"),
+        [
+            (400, "MRN12345", "validation_error", ApiResponseError),
+            (409, "MRN99999", "conflict", ApiConflictError),
+            (401, "MRN00001", "authentication_required", ApiAuthenticationError),
+            (403, "PATIENT_SSN_123", "permission_denied", ApiPermissionError),
+            (404, "MRN40404", "not_found", ApiNotFoundError),
+            (429, "MRN42900", "rate_limited", ApiRateLimitError),
+            (500, "MRN50000", "server_error", ApiResponseError),
+        ],
+    )
+    def test_patient_like_codes_replaced_with_safe_status_defaults(
+        self,
+        status_code: int,
+        raw_code: str,
+        expected_fallback_code: str,
+        expected_exc_type: type[ApiResponseError],
+    ) -> None:
+        """Task 2D-1b: Patient-like values (such as MRN12345) matching regex must be replaced with safe status defaults."""
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(status_code=status_code, json={"code": raw_code})
+
+        client = ApiClient(
+            base_url="https://api.docflow.example.com",
+            http_client=httpx.Client(
+                base_url="https://api.docflow.example.com",
+                transport=httpx.MockTransport(mock_handler),
+            ),
+        )
+
+        with pytest.raises(expected_exc_type) as exc_info:
+            client.get("/api/v1/test", authenticated=False)
+
+        err = exc_info.value
+        assert err.code == expected_fallback_code
+        assert err.status_code == status_code
+        assert raw_code not in str(err)
+        assert raw_code not in repr(err)
+        assert raw_code.lower() not in str(err)
+        assert raw_code.lower() not in repr(err)
+
+    @pytest.mark.parametrize(
+        ("status_code", "raw_code", "expected_fallback_code", "expected_exc_type"),
+        [
+            (400, "9876543210", "validation_error", ApiResponseError),
+            (409, "12345", "conflict", ApiConflictError),
+            (500, "500001", "server_error", ApiResponseError),
+            (400, 88888, "validation_error", ApiResponseError),
+        ],
+    )
+    def test_numeric_only_codes_replaced_with_safe_status_defaults(
+        self,
+        status_code: int,
+        raw_code: Any,
+        expected_fallback_code: str,
+        expected_exc_type: type[ApiResponseError],
+    ) -> None:
+        """Task 2D-1b: Numeric-only codes (phone-like, IDs, integers) must be replaced with safe status defaults."""
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(status_code=status_code, json={"code": raw_code})
+
+        client = ApiClient(
+            base_url="https://api.docflow.example.com",
+            http_client=httpx.Client(
+                base_url="https://api.docflow.example.com",
+                transport=httpx.MockTransport(mock_handler),
+            ),
+        )
+
+        with pytest.raises(expected_exc_type) as exc_info:
+            client.get("/api/v1/test", authenticated=False)
+
+        err = exc_info.value
+        assert err.code == expected_fallback_code
+        assert str(raw_code) not in str(err)
+        assert str(raw_code) not in repr(err)
+
+    @pytest.mark.parametrize(
+        ("status_code", "documented_code", "expected_exc_type"),
+        [
+            (400, "validation_error", ApiResponseError),
+            (400, "source_file_unavailable", ApiResponseError),
+            (401, "authentication_required", ApiAuthenticationError),
+            (403, "permission_denied", ApiPermissionError),
+            (404, "not_found", ApiNotFoundError),
+            (409, "idempotency_conflict", ApiConflictError),
+            (409, "state_conflict", ApiConflictError),
+            (409, "fingerprint_key_mismatch", ApiConflictError),
+            (409, "conflict", ApiConflictError),
+            (410, "activation_expired", ApiResponseError),
+            (413, "payload_too_large", ApiResponseError),
+            (415, "unsupported_media_type", ApiResponseError),
+            (422, "account_not_verified", ApiResponseError),
+            (422, "unprocessable_entity", ApiResponseError),
+            (429, "rate_limited", ApiRateLimitError),
+            (502, "provider_error", ApiResponseError),
+            (503, "provider_unavailable", ApiResponseError),
+            (504, "provider_timeout_ambiguous", ApiResponseError),
+        ],
+    )
+    def test_legitimate_documented_error_codes_remain_supported(
+        self,
+        status_code: int,
+        documented_code: str,
+        expected_exc_type: type[ApiResponseError],
+    ) -> None:
+        """Task 2D-1b: Documented, legitimate safe error codes from docs/API_CONTRACTS.md and AGENT_SPEC.md are preserved."""
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(status_code=status_code, json={"code": documented_code})
+
+        client = ApiClient(
+            base_url="https://api.docflow.example.com",
+            http_client=httpx.Client(
+                base_url="https://api.docflow.example.com",
+                transport=httpx.MockTransport(mock_handler),
+            ),
+        )
+
+        with pytest.raises(expected_exc_type) as exc_info:
+            client.get("/api/v1/test", authenticated=False)
+
+        err = exc_info.value
+        assert err.code == documented_code
+        assert err.status_code == status_code
+
+    def test_direct_exception_instantiation_sanitizes_unrecognized_code(self) -> None:
+        """Direct instantiation of ApiResponseError or subclasses sanitizes unknown codes."""
+        err1 = ApiResponseError(status_code=400, code="MRN12345")
+        assert err1.code == "validation_error"
+        assert "MRN12345" not in str(err1)
+        assert "MRN12345" not in repr(err1)
+
+        err2 = ApiResponseError(status_code=400, code="source_file_unavailable")
+        assert err2.code == "source_file_unavailable"
+
+        err3 = ApiConflictError(status_code=409, code="9876543210")
+        assert err3.code == "conflict"

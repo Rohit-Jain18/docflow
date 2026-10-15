@@ -41,10 +41,56 @@ DEFAULT_TIMEOUT = httpx.Timeout(
 TokenProvider = Callable[[], str | None]
 
 # ---------------------------------------------------------------------------
-# Security and Sanitization Helpers (Task 2D-1a)
+# Security and Sanitization Helpers (Task 2D-1a & 2D-1b)
 # ---------------------------------------------------------------------------
 
-SAFE_CODE_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+RECOGNIZED_SAFE_ERROR_CODES: frozenset[str] = frozenset({
+    # Documented API contracts (docs/API_CONTRACTS.md §§ 2 & 5)
+    "validation_error",
+    "authentication_required",
+    "permission_denied",
+    "not_found",
+    "method_not_allowed",
+    "conflict",
+    "idempotency_conflict",
+    "state_conflict",
+    "fingerprint_key_mismatch",
+    "activation_expired",
+    "payload_too_large",
+    "unsupported_media_type",
+    "account_not_verified",
+    "unprocessable_entity",
+    "rate_limited",
+    "internal_error",
+    "server_error",
+    "provider_error",
+    "provider_unavailable",
+    "provider_timeout_ambiguous",
+    "reconciliation_required",
+    # Documented Agent error/reason codes (docs/AGENT_SPEC.md §§ 5 & 10)
+    "source_file_unavailable",
+    # General fallback
+    "http_error",
+})
+
+DEFAULT_STATUS_ERROR_CODES: dict[int, str] = {
+    400: "validation_error",
+    401: "authentication_required",
+    403: "permission_denied",
+    404: "not_found",
+    405: "method_not_allowed",
+    409: "conflict",
+    410: "activation_expired",
+    413: "payload_too_large",
+    415: "unsupported_media_type",
+    422: "account_not_verified",
+    429: "rate_limited",
+    500: "server_error",
+    502: "provider_error",
+    503: "provider_unavailable",
+    504: "provider_timeout_ambiguous",
+}
+
 SAFE_REQUEST_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 SAFE_FIELD_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
@@ -91,12 +137,21 @@ def _get_generic_detail(status_code: int) -> str:
     return f"Docflow server returned HTTP {status_code} error."
 
 
+def _get_default_error_code(status_code: int) -> str:
+    """Return a safe default error code for an HTTP status code."""
+    if status_code in DEFAULT_STATUS_ERROR_CODES:
+        return DEFAULT_STATUS_ERROR_CODES[status_code]
+    if 500 <= status_code <= 599:
+        return "server_error"
+    return "http_error"
+
+
 def _sanitize_error_code(raw_code: Any, default: str) -> str:
-    """Validate and bound error code to safe alphanumeric/snake_case tokens."""
+    """Validate that error code is a recognized, documented safe code; otherwise return default."""
     if isinstance(raw_code, str):
-        cleaned = raw_code.strip()
-        if SAFE_CODE_PATTERN.fullmatch(cleaned):
-            return cleaned.lower()
+        cleaned = raw_code.strip().lower()
+        if cleaned in RECOGNIZED_SAFE_ERROR_CODES:
+            return cleaned
     return default
 
 
@@ -178,7 +233,8 @@ class ApiResponseError(ApiClientError):
         field_errors: dict[str, Any] | None = None,
     ) -> None:
         self.status_code = int(status_code)
-        self.code = _sanitize_error_code(code, default="http_error")
+        default_code = _get_default_error_code(self.status_code)
+        self.code = _sanitize_error_code(code, default=default_code)
         self.detail = detail or _get_generic_detail(self.status_code)
         self.request_id = _sanitize_request_id(request_id)
         self.field_errors = _sanitize_field_errors(field_errors)
@@ -569,7 +625,7 @@ class ApiClient:
                 field_errors=sanitized_fields,
             )
 
-        default_code = "validation_error" if status == 400 else "server_error" if status >= 500 else "http_error"
+        default_code = _get_default_error_code(status)
         safe_code = _sanitize_error_code(raw_code, default=default_code)
         raise ApiResponseError(
             status_code=status,
