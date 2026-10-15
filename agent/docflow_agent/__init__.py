@@ -9,17 +9,35 @@ __version__ = "0.1.0"
 
 from docflow_agent.pdf import ValidationResult, validate_pdf
 from docflow_agent.quarantine import QuarantineResult, quarantine_file, should_quarantine
+from docflow_agent.queue import (
+    EnqueueResult,
+    JobEvent,
+    JobQueue,
+    JobRecord,
+    JobStatus,
+    compute_fingerprint,
+    create_watcher_enqueue_adapter,
+    handle_watcher_result,
+)
 from docflow_agent.recipient import mask_phone, validate_recipient
 from docflow_agent.stability import StabilityResult, check_stability
 from docflow_agent.watcher import Watcher, is_candidate_file, process_candidate_file
 
 __all__ = [
+    "EnqueueResult",
+    "JobEvent",
+    "JobQueue",
+    "JobRecord",
+    "JobStatus",
     "QuarantineResult",
     "StabilityResult",
     "ValidationResult",
     "Watcher",
     "__version__",
     "check_stability",
+    "compute_fingerprint",
+    "create_watcher_enqueue_adapter",
+    "handle_watcher_result",
     "is_candidate_file",
     "mask_phone",
     "process_candidate_file",
@@ -28,3 +46,4 @@ __all__ = [
     "validate_pdf",
     "validate_recipient",
 ]
+
