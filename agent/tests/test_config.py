@@ -202,6 +202,56 @@ class TestUrlValidation:
         with pytest.raises(ConfigError, match="scheme must be http or https"):
             load_config(env=env)
 
+    def test_tokens_in_query_and_fragment_never_echoed(self, tmp_path: pathlib.Path) -> None:
+        secret_query_token = "SUPER_SECRET_QUERY_TOKEN_98765"
+        env = _make_valid_env(tmp_path)
+        env["api_base_url"] = f"https://api.docflow.example.com/v1?token={secret_query_token}"
+        with pytest.raises(ConfigError) as exc_info:
+            load_config(env=env)
+        err = str(exc_info.value)
+        assert "query parameters" in err
+        assert secret_query_token not in err
+
+        secret_frag_token = "SUPER_SECRET_FRAGMENT_TOKEN_43210"
+        env["api_base_url"] = f"https://api.docflow.example.com/v1#access_token={secret_frag_token}"
+        with pytest.raises(ConfigError) as exc_info2:
+            load_config(env=env)
+        err2 = str(exc_info2.value)
+        assert "URL fragments" in err2
+        assert secret_frag_token not in err2
+
+    def test_userinfo_credentials_never_echoed(self, tmp_path: pathlib.Path) -> None:
+        username = "secret_admin_user"
+        password = "super_secret_password_xyz"
+        env = _make_valid_env(tmp_path)
+        env["api_base_url"] = f"https://{username}:{password}@docflow.example.com"
+        with pytest.raises(ConfigError) as exc_info:
+            load_config(env=env)
+        err = str(exc_info.value)
+        assert "userinfo" in err
+        assert username not in err
+        assert password not in err
+
+    @pytest.mark.parametrize("bad_port", ["99999", "0", "70000", "-1", "abc"])
+    def test_invalid_ports_rejected_cleanly(self, tmp_path: pathlib.Path, bad_port: str) -> None:
+        env = _make_valid_env(tmp_path)
+        env["api_base_url"] = f"http://localhost:{bad_port}"
+        with pytest.raises(ConfigError) as exc_info:
+            load_config(env=env)
+        err = str(exc_info.value)
+        assert "port" in err
+        # Ensure bad port input is not dangerously echoed
+        assert bad_port not in err
+
+    @pytest.mark.parametrize("bad_ipv6", ["http://[::1:8000", "http://[invalid_ipv6_host]"])
+    def test_malformed_ipv6_rejected_cleanly(self, tmp_path: pathlib.Path, bad_ipv6: str) -> None:
+        env = _make_valid_env(tmp_path)
+        env["api_base_url"] = bad_ipv6
+        with pytest.raises(ConfigError) as exc_info:
+            load_config(env=env)
+        err = str(exc_info.value)
+        assert "invalid host authority" in err or "malformed" in err
+
 
 # ---------------------------------------------------------------------------
 # Invalid configuration & Secrets detection

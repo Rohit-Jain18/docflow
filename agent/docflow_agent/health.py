@@ -240,11 +240,14 @@ def health_check(
             detail="; ".join(url_errors),
         ))
     else:
-        parsed = urllib.parse.urlsplit(config.api_base_url)
-        if parsed.scheme.lower() == "https":
-            detail = "HTTPS configured."
-        else:
-            detail = f"HTTP configured on loopback host ({parsed.hostname}) for development."
+        try:
+            parsed = urllib.parse.urlsplit(config.api_base_url)
+            if parsed.scheme.lower() == "https":
+                detail = "HTTPS configured."
+            else:
+                detail = f"HTTP configured on loopback host ({parsed.hostname}) for development."
+        except Exception:
+            detail = "Valid API base URL configured."
         checks.append(CheckItem(
             name="API base URL",
             passed=True,

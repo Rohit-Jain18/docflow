@@ -87,6 +87,34 @@ class TestCLIHealth:
         captured = capsys.readouterr()
         assert "UNHEALTHY" in captured.out
 
+    def test_health_cli_sanitizes_url_errors(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        archive = tmp_path / "archive"
+        quarantine = tmp_path / "quarantine"
+        secret_token = "CLI_LEAK_TEST_TOKEN_9999"
+        toml_content = textwrap.dedent(f"""\
+            [agent]
+            api_base_url = "https://admin:super_secret_pwd@docflow.example.com?token={secret_token}"
+            watch_folder = "{watch.as_posix()}"
+            archive_folder = "{archive.as_posix()}"
+            quarantine_folder = "{quarantine.as_posix()}"
+        """)
+        config_file = tmp_path / "agent.toml"
+        config_file.write_text(toml_content, encoding="utf-8")
+        monkeypatch.setenv("DOCFLOW_AGENT_CONFIG_FILE", str(config_file))
+
+        exit_code = main(["health"])
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "UNHEALTHY" in captured.out
+        assert secret_token not in captured.out
+        assert "super_secret_pwd" not in captured.out
+        assert "admin" not in captured.out
+        assert "API base URL must not contain" in captured.out
+
 
 class TestCLIVersion:
     """Test the 'version' CLI command."""

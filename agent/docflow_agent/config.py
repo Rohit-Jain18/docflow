@@ -180,49 +180,85 @@ def is_loopback_host(hostname: str) -> bool:
 
 
 def validate_api_base_url(url: str) -> list[str]:
-    """Validate API base URL according to security rules.
+    """Validate API base URL according to security rules without echoing sensitive input.
 
     Rules:
     - Must be a non-empty string.
     - Scheme must be http or https.
-    - Hostname is required.
-    - Userinfo (username/password) is prohibited.
-    - Query strings and URL fragments are prohibited.
+    - Valid hostname is required.
+    - Userinfo (username/password) is prohibited and must never be echoed.
+    - Query strings and URL fragments are prohibited and must never be echoed.
+    - Port must be a valid integer between 1 and 65535.
+    - IPv6 authorities must be properly formatted.
     - Plain HTTP is permitted ONLY for loopback development destinations (localhost, 127.0.0.1, ::1).
     - Non-loopback destinations MUST use HTTPS.
+    - Error messages MUST NEVER echo the raw URL, userinfo, query values, or fragments.
     """
     if not url or not isinstance(url, str) or not url.strip():
-        return ["'api_base_url' is missing or empty."]
+        return ["API base URL is missing or empty."]
 
     raw_url = url.strip()
     try:
         parsed = urllib.parse.urlsplit(raw_url)
-    except Exception as exc:
-        return [f"'api_base_url' is malformed: {exc}"]
+    except Exception:
+        return ["API base URL is malformed or contains an invalid host authority."]
 
     scheme = parsed.scheme.lower()
     if scheme not in ("http", "https"):
-        return [f"'api_base_url' scheme must be http or https, got: {parsed.scheme!r}"]
+        return ["API base URL scheme must be http or https."]
 
-    hostname = parsed.hostname
-    if not hostname:
-        return [f"'api_base_url' must include a valid hostname, got: {raw_url!r}"]
+    # Userinfo check without echoing values
+    has_userinfo = False
+    try:
+        if parsed.username is not None or parsed.password is not None:
+            has_userinfo = True
+    except Exception:
+        has_userinfo = True
 
-    if parsed.username is not None or parsed.password is not None or ("@" in parsed.netloc):
-        return ["'api_base_url' must not include userinfo (username/password)."]
+    if not has_userinfo and "@" in parsed.netloc:
+        has_userinfo = True
 
+    if has_userinfo:
+        return ["API base URL must not contain userinfo (username or password)."]
+
+    # Query strings must never be echoed
     if parsed.query:
-        return [f"'api_base_url' must not include query parameters, got: {parsed.query!r}"]
+        return ["API base URL must not contain query parameters."]
 
+    # Fragments must never be echoed
     if parsed.fragment:
-        return [f"'api_base_url' must not include a fragment, got: {parsed.fragment!r}"]
+        return ["API base URL must not contain URL fragments."]
 
-    if scheme == "http" and not is_loopback_host(hostname):
-        return [
-            f"'api_base_url' uses unencrypted HTTP for non-loopback host {hostname!r}. "
-            "Plain HTTP is only permitted for loopback development destinations (localhost, 127.0.0.1); "
-            "non-loopback destinations require HTTPS."
-        ]
+    # Safely extract and validate hostname
+    try:
+        hostname = parsed.hostname
+    except Exception:
+        return ["API base URL is malformed or contains an invalid host authority."]
+
+    if not hostname:
+        return ["API base URL must include a valid hostname."]
+
+    # Validate port range safely (1 to 65535)
+    try:
+        port = parsed.port
+        if port is not None and not (1 <= port <= 65535):
+            return ["API base URL contains a malformed or out-of-range port (must be between 1 and 65535)."]
+    except Exception:
+        return ["API base URL contains a malformed or out-of-range port (must be between 1 and 65535)."]
+
+    # Enforce HTTPS for non-loopback destinations
+    if scheme == "http":
+        try:
+            is_loopback = is_loopback_host(hostname)
+        except Exception:
+            return ["API base URL contains an invalid host address."]
+
+        if not is_loopback:
+            return [
+                "API base URL uses unencrypted HTTP for a non-loopback destination. "
+                "Plain HTTP is only permitted for loopback development destinations (localhost, 127.0.0.1); "
+                "non-loopback destinations require HTTPS."
+            ]
 
     return []
 
