@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+import uuid
 import pytest
 import httpx
 
@@ -931,3 +932,169 @@ class TestLogAndExceptionSanitization:
 
         err3 = ApiConflictError(status_code=409, code="9876543210")
         assert err3.code == "conflict"
+
+    @pytest.mark.parametrize(
+        "valid_id",
+        [
+            f"req_{uuid.uuid4().hex[:16]}",  # Actual backend-generated format
+            "req_a1b2c3d4e5f60718",
+            "req_opaque_value",  # docs/API_CONTRACTS.md § 1
+            "req-12345",
+            "req-safe-12345",
+            "req-tracking-test-12345",
+            "f94fe6c0-bdbb-47ba-9f61-6d1c6ae5b1a2",  # Canonical UUID
+            "550e8400-e29b-41d4-a716-446655440000",
+        ],
+    )
+    def test_legitimate_documented_request_ids_accepted(self, valid_id: str) -> None:
+        """Legitimate documented Docflow request IDs and backend-generated IDs are accepted."""
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                status_code=400,
+                headers={"X-Request-ID": valid_id},
+                json={"code": "validation_error"},
+            )
+
+        client = ApiClient(
+            base_url="https://api.docflow.example.com",
+            http_client=httpx.Client(
+                base_url="https://api.docflow.example.com",
+                transport=httpx.MockTransport(mock_handler),
+            ),
+        )
+
+        with pytest.raises(ApiResponseError) as exc_info:
+            client.get("/api/v1/test", authenticated=False)
+
+        err = exc_info.value
+        assert err.request_id == valid_id
+        assert f"[request_id={valid_id}]" in str(err)
+        assert f"request_id='{valid_id}'" in repr(err)
+
+    @pytest.mark.parametrize(
+        "numeric_id",
+        [
+            "9876543210",  # Phone-number-like
+            "+919876543210",
+            "12345",  # Numeric-only string
+            "00000000",
+            12345,  # Integer in JSON payload
+        ],
+    )
+    def test_numeric_only_and_phone_like_request_ids_rejected(self, numeric_id: Any) -> None:
+        """Numeric-only strings and phone-number-like IDs must return None and never appear in exceptions."""
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            headers = {"X-Request-ID": str(numeric_id)} if isinstance(numeric_id, str) else {}
+            body = {"code": "validation_error", "request_id": numeric_id}
+            return httpx.Response(status_code=400, headers=headers, json=body)
+
+        client = ApiClient(
+            base_url="https://api.docflow.example.com",
+            http_client=httpx.Client(
+                base_url="https://api.docflow.example.com",
+                transport=httpx.MockTransport(mock_handler),
+            ),
+        )
+
+        with pytest.raises(ApiResponseError) as exc_info:
+            client.get("/api/v1/test", authenticated=False)
+
+        err = exc_info.value
+        assert err.request_id is None
+        assert "request_id" not in repr(err)
+        assert "[request_id=" not in str(err)
+        assert str(numeric_id) not in str(err)
+        assert str(numeric_id) not in repr(err)
+
+    @pytest.mark.parametrize(
+        "patient_id",
+        [
+            "MRN12345",
+            "MRN-998877",
+            "patient-123",
+            "patient_john_doe",
+            "PATIENT-456",
+            "SSN-000-11-2222",
+            "req-MRN12345",  # Disguised with req- prefix
+            "req-patient-999",
+            "req-ssn-001",
+        ],
+    )
+    def test_patient_like_request_ids_rejected(self, patient_id: str) -> None:
+        """Patient identifiers must be rejected as request IDs and excluded from exception messages/reprs."""
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                status_code=400,
+                headers={"X-Request-ID": patient_id},
+                json={"code": "validation_error"},
+            )
+
+        client = ApiClient(
+            base_url="https://api.docflow.example.com",
+            http_client=httpx.Client(
+                base_url="https://api.docflow.example.com",
+                transport=httpx.MockTransport(mock_handler),
+            ),
+        )
+
+        with pytest.raises(ApiResponseError) as exc_info:
+            client.get("/api/v1/test", authenticated=False)
+
+        err = exc_info.value
+        assert err.request_id is None
+        assert "request_id" not in repr(err)
+        assert "[request_id=" not in str(err)
+        assert patient_id not in str(err)
+        assert patient_id not in repr(err)
+
+    @pytest.mark.parametrize(
+        "malformed_id",
+        [
+            "",
+            "   ",
+            "req-",
+            "req_",
+            "req-with spaces",
+            "req-invalid$char",
+            "req-invalid@symbol",
+            "req-" + "a" * 100,  # Length > 64
+        ],
+    )
+    def test_malformed_request_ids_rejected(self, malformed_id: str) -> None:
+        """Malformed or unbounded request IDs must return None and be excluded from exceptions."""
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                status_code=400,
+                headers={"X-Request-ID": malformed_id},
+                json={"code": "validation_error"},
+            )
+
+        client = ApiClient(
+            base_url="https://api.docflow.example.com",
+            http_client=httpx.Client(
+                base_url="https://api.docflow.example.com",
+                transport=httpx.MockTransport(mock_handler),
+            ),
+        )
+
+        with pytest.raises(ApiResponseError) as exc_info:
+            client.get("/api/v1/test", authenticated=False)
+
+        err = exc_info.value
+        assert err.request_id is None
+        assert "request_id" not in repr(err)
+        assert "[request_id=" not in str(err)
+
+    def test_direct_exception_instantiation_sanitizes_request_id(self) -> None:
+        """Direct instantiation of ApiResponseError sanitizes request_id."""
+        err_invalid = ApiResponseError(status_code=400, request_id="MRN12345")
+        assert err_invalid.request_id is None
+        assert "MRN12345" not in str(err_invalid)
+        assert "MRN12345" not in repr(err_invalid)
+        assert "[request_id=" not in str(err_invalid)
+
+        backend_id = f"req_{uuid.uuid4().hex[:16]}"
+        err_valid = ApiResponseError(status_code=400, request_id=backend_id)
+        assert err_valid.request_id == backend_id
+        assert f"[request_id={backend_id}]" in str(err_valid)
+        assert f"request_id='{backend_id}'" in repr(err_valid)

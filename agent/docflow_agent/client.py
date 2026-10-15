@@ -91,7 +91,11 @@ DEFAULT_STATUS_ERROR_CODES: dict[int, str] = {
     504: "provider_timeout_ambiguous",
 }
 
-SAFE_REQUEST_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+SAFE_REQUEST_ID_PREFIX_PATTERN = re.compile(r"^req[_-][a-zA-Z0-9_-]{1,60}$")
+SAFE_REQUEST_ID_UUID_PATTERN = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+DISALLOWED_REQUEST_ID_TOKENS = ("mrn", "patient", "ssn", "dob")
 SAFE_FIELD_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
 SAFE_FIELD_ERROR_TOKENS: frozenset[str] = frozenset({
@@ -156,12 +160,35 @@ def _sanitize_error_code(raw_code: Any, default: str) -> str:
 
 
 def _sanitize_request_id(raw_id: Any) -> str | None:
-    """Validate and bound request ID to safe alphanumeric tokens."""
-    if isinstance(raw_id, str):
-        cleaned = raw_id.strip()
-        if SAFE_REQUEST_ID_PATTERN.fullmatch(cleaned):
-            return cleaned
-    return None
+    """Validate that request ID matches the documented Docflow format and contains no patient data.
+
+    Accepts:
+      - Documented prefixed request IDs (e.g. req_<hex16>, req_opaque_value, req-12345)
+      - Standard canonical UUIDs
+    Rejects:
+      - Numeric-only strings and phone-number-like values
+      - Patient identifiers (MRN, patient name, SSN)
+      - Malformed or unbounded values
+    Returns None if invalid so the ID is excluded from exception messages and representations.
+    """
+    if not isinstance(raw_id, str):
+        return None
+    cleaned = raw_id.strip()
+    if not (5 <= len(cleaned) <= 64):
+        return None
+
+    # Check against documented prefixed format or UUID
+    is_prefixed = bool(SAFE_REQUEST_ID_PREFIX_PATTERN.fullmatch(cleaned))
+    is_uuid = bool(SAFE_REQUEST_ID_UUID_PATTERN.fullmatch(cleaned))
+    if not (is_prefixed or is_uuid):
+        return None
+
+    # Block any patient-identifying substrings
+    lower_cleaned = cleaned.lower()
+    if any(token in lower_cleaned for token in DISALLOWED_REQUEST_ID_TOKENS):
+        return None
+
+    return cleaned
 
 
 def _sanitize_field_errors(raw_field_errors: Any) -> dict[str, list[str]]:
