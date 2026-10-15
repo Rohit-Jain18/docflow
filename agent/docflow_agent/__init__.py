@@ -7,6 +7,17 @@ report registration and delivery through the Docflow control plane.
 
 __version__ = "0.1.0"
 
+from docflow_agent.activation import (
+    ActivationCodeExpiredError,
+    ActivationError,
+    ActivationRateLimitedError,
+    ActivationResult,
+    ActivationService,
+    ActivationStorageError,
+    ActivationValidationError,
+    DeviceInfo,
+    activate_device,
+)
 from docflow_agent.client import (
     ApiClient,
     ApiClientError,
@@ -38,8 +49,16 @@ from docflow_agent.stability import StabilityResult, check_stability
 from docflow_agent.watcher import Watcher, is_candidate_file, process_candidate_file
 
 __all__ = [
+    "ActivationCodeExpiredError",
+    "ActivationError",
+    "ActivationRateLimitedError",
+    "ActivationResult",
+    "ActivationService",
+    "ActivationStorageError",
+    "ActivationValidationError",
     "ApiClient",
     "ApiClientError",
+    "activate_device",
     "ApiAuthenticationError",
     "ApiConflictError",
     "ApiConnectionError",
@@ -49,6 +68,7 @@ __all__ = [
     "ApiRateLimitError",
     "ApiResponseError",
     "ApiTimeoutError",
+    "DeviceInfo",
     "EnqueueResult",
     "JobEvent",
     "JobQueue",

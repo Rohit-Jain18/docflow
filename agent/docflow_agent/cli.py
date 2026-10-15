@@ -1,9 +1,10 @@
 """
 CLI for the Docflow Windows Agent.
 
-Provides the ``health``, ``status``, and ``version`` subcommands.
+Provides the ``activate``, ``health``, ``status``, and ``version`` subcommands.
 
 Usage:
+    python -m docflow_agent activate   Activate agent device with one-time code.
     python -m docflow_agent health     Validate config, permissions and readiness.
     python -m docflow_agent status     Alias for health check report.
     python -m docflow_agent version    Print agent version.
@@ -12,11 +13,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 
 import docflow_agent
+from docflow_agent.activation import ActivationError, activate_device
+from docflow_agent.client import ApiClient
 from docflow_agent.health import health_check
 from docflow_agent.logging import setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 def _cmd_health(args: argparse.Namespace) -> int:
@@ -32,6 +38,56 @@ def _cmd_version(args: argparse.Namespace) -> int:
     _ = args
     print(f"docflow-agent {docflow_agent.__version__}")
     return 0
+
+
+def _cmd_activate(args: argparse.Namespace) -> int:
+    """Activate agent device using a one-time activation code."""
+    from docflow_agent.config import load_config
+    from docflow_agent.queue import JobQueue
+
+    code = getattr(args, "activation_code", None)
+    if not code:
+        try:
+            import getpass
+            code = getpass.getpass("Enter one-time activation code: ").strip()
+        except Exception:
+            code = input("Enter one-time activation code: ").strip()
+
+    if not code:
+        print("Error: Activation code is required.", file=sys.stderr)
+        return 1
+
+    try:
+        cfg = load_config()
+    except Exception as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        queue = JobQueue.from_config(cfg)
+    except Exception as exc:
+        logger.debug("JobQueue initialization failed (%s); proceeding without local queue persistence", exc)
+        queue = None
+
+    try:
+        with ApiClient(base_url=cfg.api_base_url) as client:
+            result = activate_device(
+                client=client,
+                activation_code=code,
+                queue=queue,
+            )
+        print(f"Device successfully activated.")
+        print(f"  Device ID: {result.device.id}")
+        print(f"  Device Name: {result.device.name}")
+        print(f"  Branch ID: {result.device.branch_id}")
+        print(f"  Configuration Version: {result.configuration_version}")
+        return 0
+    except ActivationError as exc:
+        print(f"Activation failed: {exc.code} - {exc.message}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"Activation failed: {exc}", file=sys.stderr)
+        return 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -69,6 +125,18 @@ def main(argv: list[str] | None = None) -> int:
         help="Print agent version.",
     )
     version_parser.set_defaults(func=_cmd_version)
+
+    # activate
+    activate_parser = subparsers.add_parser(
+        "activate",
+        help="Activate agent device using a one-time activation code.",
+    )
+    activate_parser.add_argument(
+        "--code",
+        dest="activation_code",
+        help="One-time activation code (prompts securely if omitted).",
+    )
+    activate_parser.set_defaults(func=_cmd_activate)
 
     args = parser.parse_args(argv)
 
