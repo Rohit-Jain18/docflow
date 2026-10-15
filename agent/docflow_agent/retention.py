@@ -38,6 +38,7 @@ from datetime import timezone
 import logging
 import os
 import pathlib
+import stat
 from typing import Any
 
 from docflow_agent.queue import (
@@ -169,22 +170,58 @@ def is_safe_path_for_deletion(
     """Verify that a candidate file path is safe to delete.
 
     Rules:
-    - Path must resolve strictly inside an approved folder (watch, archive, quarantine).
-    - Symlinks and reparse points are strictly rejected to prevent path traversal.
+    - Path metadata is inspected via lstat BEFORE any path resolution.
+    - Symlinks and Windows reparse points are strictly rejected to prevent traversal.
+    - Candidate must be a regular file.
+    - Candidate must resolve strictly inside an approved folder (watch, archive, quarantine).
+    - Fails closed with static reason codes if metadata inspection or resolution fails.
+    - Never interpolates raw paths into error codes or exception text.
     """
-    try:
-        resolved_path = pathlib.Path(candidate_path).resolve()
-    except (OSError, ValueError) as exc:
-        return False, f"Path resolution failed: {exc}"
+    p = pathlib.Path(candidate_path)
 
-    # Check symlinks / reparse points
+    # 1. Inspect original un-resolved path metadata using lstat
     try:
-        if resolved_path.is_symlink():
-            return False, f"Path '{candidate_path}' is a symlink. Refusing deletion."
+        st = os.lstat(p)
     except (OSError, ValueError):
-        pass
+        return False, "path_inspection_failed"
 
-    # Boundary verification: must be strictly inside an allowed directory
+    # 2. Reject symbolic links on original un-resolved path
+    if stat.S_ISLNK(st.st_mode) or p.is_symlink():
+        return False, "symlink_rejected"
+
+    # 3. Reject Windows reparse points on un-resolved path
+    attrs = getattr(st, "st_file_attributes", 0)
+    reparse_attr = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if attrs and (attrs & reparse_attr):
+        return False, "reparse_point_rejected"
+
+    # 4. Must be a regular file
+    if not stat.S_ISREG(st.st_mode):
+        return False, "not_regular_file"
+
+    # 5. Resolve path and verify boundaries
+    try:
+        resolved_path = p.resolve(strict=False)
+    except (OSError, ValueError):
+        return False, "path_resolution_failed"
+
+    # 6. Re-check resolved path metadata
+    try:
+        res_st = os.lstat(resolved_path)
+    except (OSError, ValueError):
+        return False, "path_inspection_failed"
+
+    if stat.S_ISLNK(res_st.st_mode) or resolved_path.is_symlink():
+        return False, "symlink_rejected"
+
+    res_attrs = getattr(res_st, "st_file_attributes", 0)
+    if res_attrs and (res_attrs & reparse_attr):
+        return False, "reparse_point_rejected"
+
+    if not stat.S_ISREG(res_st.st_mode):
+        return False, "not_regular_file"
+
+    # 7. Boundary verification: must be strictly inside an allowed directory
     is_inside_allowed = False
     for folder in allowed_folders:
         try:
@@ -196,9 +233,9 @@ def is_safe_path_for_deletion(
             continue
 
     if not is_inside_allowed:
-        return False, f"Path '{candidate_path}' is outside approved local folder boundaries."
+        return False, "outside_allowed_boundaries"
 
-    return True, "Safe path verified."
+    return True, "safe"
 
 
 class CleanupService:
@@ -238,17 +275,25 @@ class CleanupService:
                 logger.debug("Skipping job %s cleanup: %s", job.id, check.reason)
                 continue
 
-            # 2. Safe path validation
-            is_safe, reason = is_safe_path_for_deletion(job.source_path, self.allowed_folders)
+            # 2. Safe path validation (returns static reason code without paths)
+            is_safe, reason_code = is_safe_path_for_deletion(job.source_path, self.allowed_folders)
             if not is_safe:
-                logger.error("Job %s path failed safety check: %s. Preserving file.", job.id, reason)
+                logger.error("Job %s path failed safety check: %s. Preserving file.", job.id, reason_code)
                 continue
 
             source_file = pathlib.Path(job.source_path)
 
-            # 3. Best-effort deletion
+            # 3. Best-effort deletion with immediate pre-deletion safety re-check (TOCTOU mitigation)
             try:
                 if source_file.exists():
+                    re_safe, re_reason = is_safe_path_for_deletion(job.source_path, self.allowed_folders)
+                    if not re_safe:
+                        logger.error(
+                            "Job %s path failed TOCTOU safety recheck: %s. Preserving file.",
+                            job.id,
+                            re_reason,
+                        )
+                        continue
                     source_file.unlink()
                     logger.info("Deleted source PDF for job %s (terminal status: %s)", job.id, job.status)
                 else:
@@ -258,18 +303,16 @@ class CleanupService:
                 self.queue.mark_source_deleted(job.id, deletion_verified_at=now_iso)
                 deleted_count += 1
 
-            except PermissionError as exc:
+            except PermissionError:
                 # File is currently locked by another process (e.g. LIS or antivirus)
                 logger.warning(
-                    "Source PDF for job %s is locked (%s); will retry next cleanup cycle.",
+                    "Source PDF for job %s is locked; will retry next cleanup cycle.",
                     job.id,
-                    type(exc).__name__,
                 )
-            except OSError as exc:
+            except OSError:
                 logger.warning(
-                    "Failed to delete source PDF for job %s: %s; preserving record.",
+                    "Failed to delete source PDF for job %s; preserving record.",
                     job.id,
-                    type(exc).__name__,
                 )
 
         return deleted_count

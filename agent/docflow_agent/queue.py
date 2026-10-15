@@ -1398,6 +1398,32 @@ class JobQueue:
                 (key, str(value), now_iso),
             )
 
+    def set_settings_atomic(self, settings_dict: dict[str, str]) -> None:
+        """Persist multiple non-secret settings within a single atomic write transaction."""
+        for key in settings_dict:
+            norm = normalize_key(key)
+            if is_prohibited_key(norm) or any(
+                stem in norm for stem in ("token", "secret", "password", "credential", "auth")
+            ):
+                raise ProhibitedSecretError(
+                    f"Prohibited secret key '{key}' cannot be stored in agent_settings. "
+                    "Credentials and tokens must be stored in secure credential storage."
+                )
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._write_transaction() as conn:
+            for key, value in settings_dict.items():
+                conn.execute(
+                    """
+                    INSERT INTO agent_settings (key, value, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value,
+                        updated_at = excluded.updated_at;
+                    """,
+                    (key, str(value), now_iso),
+                )
+
     def list_settings(self) -> dict[str, str]:
         """List all non-secret settings currently persisted."""
         with self._read_connection() as conn:

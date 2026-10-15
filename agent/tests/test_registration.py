@@ -265,3 +265,224 @@ class TestReportRegistrationService:
 
         with pytest.raises(RegistrationError):
             service.register_job(failed_job)
+
+    @pytest.mark.parametrize(
+        "invalid_body,error_substr",
+        [
+            (
+                {"report_id": str(uuid.uuid4()), "status": "pending", "duplicate": False, "created_at": "2026-10-15T12:00:00Z"},
+                "expected 'queued'",
+            ),
+            (
+                {"report_id": "not-a-valid-uuid", "status": "queued", "duplicate": False, "created_at": "2026-10-15T12:00:00Z"},
+                "valid UUID",
+            ),
+            (
+                {"report_id": str(uuid.uuid4()), "status": "queued", "duplicate": 1, "created_at": "2026-10-15T12:00:00Z"},
+                "valid boolean 'duplicate'",
+            ),
+            (
+                {"report_id": str(uuid.uuid4()), "status": "queued", "duplicate": "true", "created_at": "2026-10-15T12:00:00Z"},
+                "valid boolean 'duplicate'",
+            ),
+            (
+                {"report_id": str(uuid.uuid4()), "status": "queued", "duplicate": False, "created_at": "2026-10-15T12:00:00+05:30"},
+                "valid UTC Z 'created_at'",
+            ),
+            (
+                {"report_id": str(uuid.uuid4()), "status": "queued", "duplicate": False, "created_at": "2026-02-31T12:00:00Z"},
+                "calendar-valid UTC timestamp",
+            ),
+        ],
+    )
+    def test_registration_strict_validation_invalid_fields(
+        self, queue: JobQueue, sample_job, invalid_body: dict, error_substr: str
+    ):
+        job, branch_id = sample_job
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(202, json=invalid_body)
+
+        client = _make_client(handler)
+        service = ReportRegistrationService(client=client, queue=queue, branch_id=branch_id)
+
+        with pytest.raises(ApiPayloadError) as exc_info:
+            service.register_job(job)
+
+        assert error_substr in str(exc_info.value)
+        # Job must be kept in RETRY_WAIT, NOT marked FAILED!
+        updated = queue.get_job(job.id)
+        assert updated is not None
+        assert updated.status == JobStatus.RETRY_WAIT.value
+        assert updated.last_error_code == "malformed_registration_response"
+
+    def test_registration_canary_sanitization(
+        self, queue: JobQueue, sample_job, caplog: pytest.LogCaptureFixture
+    ):
+        import logging
+        job, branch_id = sample_job
+        canary_report_id = "CANARY_REPORT_ID_SECRET_+919876543210"
+        canary_status = "CANARY_STATUS_PATIENT_DO_NOT_LEAK"
+        canary_created_at = "CANARY_CREATED_AT_CONFIDENTIAL"
+
+        for field, canary_val in [
+            ("report_id", canary_report_id),
+            ("status", canary_status),
+            ("created_at", canary_created_at),
+        ]:
+            body = {
+                "report_id": str(uuid.uuid4()),
+                "status": "queued",
+                "duplicate": False,
+                "created_at": "2026-10-15T12:00:00Z",
+            }
+            body[field] = canary_val
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                return httpx.Response(202, json=body)
+
+            client = _make_client(handler)
+            service = ReportRegistrationService(client=client, queue=queue, branch_id=branch_id)
+
+            caplog.clear()
+            with caplog.at_level(logging.DEBUG):
+                with pytest.raises(ApiPayloadError) as exc_info:
+                    service.register_job(job)
+
+            assert canary_val not in str(exc_info.value)
+            assert canary_val not in repr(exc_info.value)
+            assert canary_val not in caplog.text
+
+    def test_registration_malformed_response_followed_by_duplicate_recovery(
+        self, queue: JobQueue, sample_job
+    ):
+        job, branch_id = sample_job
+        expected_report_id = str(uuid.uuid4())
+        initial_key = job.idempotency_key
+
+        responses = [
+            # First attempt: backend registered the report, but returned malformed payload (missing duplicate)
+            httpx.Response(
+                202,
+                json={
+                    "report_id": expected_report_id,
+                    "status": "queued",
+                    "created_at": "2026-10-15T12:00:00Z",
+                    # duplicate field missing entirely!
+                },
+            ),
+            # Second attempt: resending exact same request returns duplicate: True with valid payload
+            httpx.Response(
+                202,
+                json={
+                    "report_id": expected_report_id,
+                    "status": "queued",
+                    "duplicate": True,
+                    "created_at": "2026-10-15T12:00:00Z",
+                },
+            ),
+        ]
+
+        attempt = 0
+        captured_keys = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempt
+            captured_keys.append(request.headers.get("Idempotency-Key"))
+            resp = responses[attempt]
+            attempt += 1
+            return resp
+
+        client = _make_client(handler)
+        service = ReportRegistrationService(client=client, queue=queue, branch_id=branch_id)
+
+        # First call fails closed on malformed response
+        with pytest.raises(ApiPayloadError):
+            service.register_job(job)
+
+        # Job is preserved in RETRY_WAIT, not FAILED
+        job_after_fail = queue.get_job(job.id)
+        assert job_after_fail is not None
+        assert job_after_fail.status == JobStatus.RETRY_WAIT.value
+        assert job_after_fail.idempotency_key == initial_key
+
+        # Second call retries with the same job and succeeds!
+        res = service.register_job(job_after_fail)
+        assert res.report_id == expected_report_id
+        assert res.is_duplicate is True
+
+        # Job is now successfully METADATA_REGISTERED
+        job_after_recovery = queue.get_job(job.id)
+        assert job_after_recovery is not None
+        assert job_after_recovery.status == JobStatus.METADATA_REGISTERED.value
+        assert job_after_recovery.docflow_report_id == expected_report_id
+
+        # Prove identical idempotency key was sent both times
+        assert len(captured_keys) == 2
+        assert captured_keys[0] == captured_keys[1] == initial_key
+
+    def test_registration_403_raises_device_revoked_and_preserves_job(
+        self, queue: JobQueue, sample_job
+    ):
+        from docflow_agent.sync import DeviceRevokedError
+        job, branch_id = sample_job
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                403,
+                json={
+                    "type": "about:blank",
+                    "title": "Forbidden",
+                    "status": 403,
+                    "code": "permission_denied",
+                    "detail": "Device or branch is inactive.",
+                },
+            )
+
+        client = _make_client(handler)
+        service = ReportRegistrationService(client=client, queue=queue, branch_id=branch_id)
+
+        with pytest.raises(DeviceRevokedError):
+            service.register_job(job)
+
+        updated = queue.get_job(job.id)
+        assert updated is not None
+        assert updated.status == JobStatus.RETRY_WAIT.value
+        assert updated.last_error_code == "device_revoked"
+        # Must not arm cleanup eligibility
+        assert updated.cleanup_eligible_at is None
+
+    def test_registration_token_errors_preserve_job(
+        self, queue: JobQueue, sample_job
+    ):
+        from docflow_agent.token_manager import (
+            TokenAuthenticationError,
+            TokenReuseConflictError,
+            TokenRotationAmbiguousError,
+            TokenRateLimitedError,
+        )
+        job, branch_id = sample_job
+
+        for exc_to_raise in [
+            TokenAuthenticationError("token_authentication_failed"),
+            TokenReuseConflictError("token_reuse_detected"),
+            TokenRotationAmbiguousError("Ambiguous token rotation outcome"),
+            TokenRateLimitedError("Rate limited", retry_after=45),
+        ]:
+            def handler(request: httpx.Request) -> httpx.Response:
+                raise exc_to_raise
+
+            client = _make_client(handler)
+            service = ReportRegistrationService(client=client, queue=queue, branch_id=branch_id)
+
+            # Move job back to VALIDATED
+            queue.update_status(job.id, JobStatus.VALIDATED)
+            current_job = queue.get_job(job.id)
+
+            with pytest.raises(type(exc_to_raise)):
+                service.register_job(current_job)
+
+            updated = queue.get_job(job.id)
+            assert updated is not None
+            assert updated.status == JobStatus.RETRY_WAIT.value
+            assert updated.cleanup_eligible_at is None

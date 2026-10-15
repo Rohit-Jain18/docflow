@@ -665,3 +665,46 @@
   - Python Bytecode Compilation: **100% clean** (`compileall` 0 errors).
   - Import Checks: **100% clean** (all agent runtime, service, and sync modules imported successfully).
   - Backend System & Migration Checks: **0 issues, 0 pending migrations**.
+
+## 2026-10-15T17:30:00+05:30 — Phase 2 Corrective Review: Integration Defect Remediation and Ledger Corrections
+
+- **Phase / task:** Phase 2 / Review Remediation — External Review Integration Defect Corrections
+- **Goal:** Correct 5 verified integration defects identified during external review of commit `aec3313`:
+  1. Token/authentication failure handling in service runner, runtime, and registration.
+  2. Remote configuration: atomic persistence to SQLite and live candidate-processing application.
+  3. Source-PDF cleanup filesystem safety: `os.lstat` before path resolve, Windows reparse points rejection, boundary verification, TOCTOU re-check immediately before unlinking, static reason codes, and zero path/exception leakage in error logs.
+  4. Remote response sanitization: zero canary text, phone numbers, patient data, or raw server values in logs, exceptions, or string representations.
+  5. Strict report-registration 202 response validation, UUID canonicalization, strict UTC ISO-8601 'Z' calendar-validity checks, recovery via identical canonical request/idempotency key replay, and 409 idempotency conflict preservation.
+  6. Correct inaccurate ledger claims regarding historical test module count, registration payload fields, and 409 conflict handling.
+- **Inspection:** Inspected `agent/docflow_agent/runtime.py`, `service.py`, `registration.py`, `token_manager.py`, `queue.py`, `sync.py`, `retention.py`, `agent/tests/test_*.py`, `docs/API_CONTRACTS.md`, `docs/AGENT_SPEC.md`, `progress.md`.
+- **Changes:**
+  - `agent/docflow_agent/queue.py`: Added `set_settings_atomic(settings_dict)` executing multi-key atomic persistence under `_write_transaction()`, ensuring remote configuration version and settings roll back completely upon error.
+  - `agent/docflow_agent/retention.py`: Refactored `is_safe_path_for_deletion` to run `os.lstat` before path resolution; reject symlinks on the original un-resolved path, Windows reparse points (`stat.FILE_ATTRIBUTE_REPARSE_POINT` / `0x400`), non-regular files, and paths outside allowed boundaries; return static reason codes; omit all absolute paths and raw exception text from logs; revalidate path immediately before `source_file.unlink()` to minimize TOCTOU window.
+  - `agent/docflow_agent/sync.py`: Enforced calendar-valid UTC ISO-8601 ending in `Z`; allowlisted device statuses (`active`, `inactive`, `suspended`, `revoked`), mapping unknown/canary values to generic error text without string interpolation; wired atomic persistence in `ConfigSyncService.fetch_and_apply` with `on_applied` callback.
+  - `agent/docflow_agent/registration.py`: Strictly validated 202 response schema (`status == "queued"`, valid UUID `report_id`, explicit boolean `duplicate` without `bool()` coercion, calendar-valid UTC ISO-8601 ending in `Z`); preserved job in `RETRY_WAIT` with unchanged `Idempotency-Key` upon malformed response; handled `ApiPermissionError` (403), `TokenAuthenticationError`, `TokenReuseConflictError`, `TokenRotationAmbiguousError`, and `TokenRateLimitedError` by preserving jobs in `RETRY_WAIT` without arming terminal cleanup eligibility.
+  - `agent/docflow_agent/runtime.py`: Added `LiveProcessingConfig` and dynamic watcher candidate-processing callback under `_config_lock`, applying validated operational configuration to live candidate ingestion; added pause and rate-limit handling for device revocation and token errors; recovered auth-interrupted jobs to `RETRY_WAIT` without burning retry attempts or arming cleanup; safely released worker leases in `finally`.
+  - `agent/docflow_agent/service.py`: Distinctly caught `DeviceRevokedError`, `TokenAuthenticationError`, `TokenReuseConflictError`, `TokenRotationAmbiguousError`, and `TokenRateLimitedError` in `ServiceRunner.run()`, setting `runtime.is_paused = True` and pausing registration sweeps immediately.
+  - `agent/tests/test_retention.py`: Added tests for safe path inspection, symlink rejection, reparse point rejection, boundary checks, and uninspectable path failure.
+  - `agent/tests/test_sync.py`: Added tests for heartbeat and config sync canary text sanitization, atomic settings persistence failure rollback, malformed config rollback, and live watcher config updates.
+  - `agent/tests/test_registration.py`: Added tests for each invalid field/type in 202 response, canary text sanitization, malformed 202 recovery via duplicate 202 response with identical idempotency key, 403 device revocation job preservation, and token error job preservation.
+  - `agent/tests/test_runtime.py`: Added tests for runtime registration 403 pause, token errors pause, rate limiting pause with `retry_after`, and ServiceRunner heartbeat 403 pause.
+  - `progress.md`: Appended this corrective ledger entry; corrected the historical Agent test module count from 18 to 19 modules; corrected the registration payload description (`recipient_phone_e164`, `content_sha256`, `file_size_bytes`, `document_type`, `agent_created_at`, plus `Idempotency-Key` header); documented actual contract that identical idempotent requests return an existing report (202 duplicate: true) and 409 represents an idempotency conflict (not existing report lookup); maintained Windows packaged-binary status as Unverified until a frozen binary is built and smoke-tested on Windows.
+- **Why:** Resolve all integration defects identified during external review of commit `aec3313`, ensuring robust failure isolation, zero PII/secret leaks, atomic remote config updates, and accurate ledger documentation.
+- **Commands run:**
+  - `agent\.venv\Scripts\python -m pytest agent\tests\test_retention.py -v` (10 passed, 2 skipped in 1.19s)
+  - `agent\.venv\Scripts\python -m pytest agent\tests\test_sync.py -v` (16 passed in 1.23s)
+  - `agent\.venv\Scripts\python -m pytest agent\tests\test_registration.py -v` (17 passed in 1.97s)
+  - `agent\.venv\Scripts\python -m pytest agent\tests\test_runtime.py -v` (14 passed in 4.43s)
+  - `agent\.venv\Scripts\python -m pytest agent\tests -v` (500 passed, 2 skipped in 30.58s across 19 test modules)
+  - `agent\.venv\Scripts\python -m compileall -q agent\docflow_agent agent\tests` (0 errors, 0 warnings)
+  - `agent\.venv\Scripts\python -c "import sys; sys.path.insert(0, 'agent'); import docflow_agent; from docflow_agent import sync, registration, retention, media, runtime, service, queue, token_manager; print('ALL AGENT MODULES IMPORT CLEANLY')"` (ALL AGENT MODULES IMPORT CLEANLY)
+  - `git diff --check` (clean, 0 whitespace errors)
+- **Tests/checks:**
+  - Full Agent Test Suite: **500 passed, 2 skipped in 30.58s** across 19 test modules (0 failures, 0 errors).
+  - Python Bytecode Compilation: **100% clean**.
+  - Module Imports: **100% clean**.
+  - Git Diff Checks: **100% clean**.
+- **Security/reliability checks:** Zero raw server-controlled values or canary tokens in logs/exceptions; symlinks and reparse points rejected before path resolution; atomic config persistence prevents partial settings corruption; interrupted auth/rate-limited jobs preserved in `RETRY_WAIT` with leases released and no cleanup eligibility armed; identical canonical idempotency key preserved across retry/duplicate recovery.
+- **Decisions:** Keep Windows packaged binary status as Unverified until a frozen executable is built and smoke-tested on Windows. Preserve historical ledger entries intact while appending dated corrective notes.
+- **Open issues/blockers:** Windows packaged-binary smoke testing on Windows host pending. Phase 3 deferred.
+- **Next step:** Commit and push corrective review changes to `origin/main`.

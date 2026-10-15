@@ -27,7 +27,7 @@ import datetime
 import logging
 import re
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 from docflow_agent.client import (
     ApiClient,
@@ -107,14 +107,19 @@ class RemoteConfig:
 
 
 def validate_iso_utc_timestamp(ts: str | None) -> str | None:
-    """Ensure timestamp is valid ISO 8601 UTC string ending in 'Z'."""
+    """Ensure timestamp is valid ISO 8601 UTC string ending in 'Z' and calendar-valid."""
     if ts is None:
         return None
     val = str(ts).strip()
     if not _ISO8601_UTC_Z_REGEX.match(val):
-        raise ConfigValidationError(
-            f"Timestamp '{val}' does not match strict ISO 8601 UTC format ending in 'Z'."
-        )
+        raise ConfigValidationError("Timestamp does not match strict ISO 8601 UTC format ending in 'Z'.")
+    try:
+        iso_clean = val[:-1] + "+00:00"
+        dt = datetime.datetime.fromisoformat(iso_clean)
+        if dt.tzinfo is None:
+            raise ValueError
+    except (ValueError, TypeError):
+        raise ConfigValidationError("Timestamp is not a calendar-valid UTC date/time.")
     return val
 
 
@@ -124,6 +129,7 @@ def parse_remote_config(data: Any) -> RemoteConfig:
     Security rules:
     - Never accept or process api_base_url, credentials, tokens, or tenant/account authority.
     - Bound all numeric thresholds to prevent resource exhaustion or denial-of-service.
+    - Never interpolate untrusted server inputs into exception messages or logs.
     """
     if not isinstance(data, dict):
         raise ConfigValidationError("Remote configuration payload must be a JSON object.")
@@ -170,9 +176,7 @@ def parse_remote_config(data: Any) -> RemoteConfig:
     # 3. Phone region
     region = str(data.get("default_phone_region", "")).strip().upper()
     if not _PHONE_REGION_REGEX.match(region):
-        raise ConfigValidationError(
-            f"default_phone_region must be a 2-letter uppercase ISO country code, got '{region}'."
-        )
+        raise ConfigValidationError("default_phone_region must be a 2-letter uppercase ISO country code.")
 
     # 4. Stability thresholds
     sample_sec = data.get("stability_sample_seconds")
@@ -277,22 +281,36 @@ class HeartbeatService:
             raise ApiPayloadError("Heartbeat response missing valid 'server_time'.")
         if not _ISO8601_UTC_Z_REGEX.match(raw_server_time):
             raise ApiPayloadError("Heartbeat 'server_time' is not in strict ISO 8601 UTC Z format.")
+        try:
+            iso_clean = raw_server_time[:-1] + "+00:00"
+            dt = datetime.datetime.fromisoformat(iso_clean)
+            if dt.tzinfo is None:
+                raise ValueError
+        except (ValueError, TypeError):
+            raise ApiPayloadError("Heartbeat 'server_time' is not a calendar-valid UTC timestamp.")
 
         if not isinstance(raw_version, int) or raw_version < 1:
             raise ApiPayloadError("Heartbeat response missing valid 'configuration_version'.")
 
-        is_active = (raw_status == "active")
+        ALLOWED_DEVICE_STATUSES = {"active", "inactive", "suspended", "revoked"}
+        safe_status = raw_status if raw_status in ALLOWED_DEVICE_STATUSES else "unknown"
+
+        is_active = (safe_status == "active")
         if not is_active:
-            logger.error("Device status in heartbeat is not active ('%s'). Pausing operations.", raw_status)
-            raise DeviceRevokedError(f"Device status is '{raw_status}'. Operations suspended.")
+            if safe_status != "unknown":
+                logger.error("Device status in heartbeat is not active (%s). Pausing operations.", safe_status)
+                raise DeviceRevokedError(f"Device status is '{safe_status}'. Operations suspended.")
+            else:
+                logger.error("Heartbeat received unrecognized device status. Pausing operations.")
+                raise DeviceRevokedError("Device status is invalid; expected 'active'. Operations suspended.")
 
         result = HeartbeatResult(
             server_time=raw_server_time,
             configuration_version=raw_version,
-            device_status=raw_status,
+            device_status=safe_status,
             is_active=is_active,
         )
-        logger.debug("Heartbeat successful: config_version=%d, status=%s", raw_version, raw_status)
+        logger.debug("Heartbeat successful: config_version=%d, status=%s", raw_version, safe_status)
         return result
 
 
@@ -317,20 +335,29 @@ class ConfigSyncService:
                 pass
         return 0
 
-    def fetch_and_apply(self) -> RemoteConfig:
-        """Fetch GET /api/v1/agent/config, validate, and persist safe operational parameters."""
+    def fetch_and_apply(
+        self,
+        on_applied: Callable[[RemoteConfig], None] | None = None,
+    ) -> RemoteConfig:
+        """Fetch GET /api/v1/agent/config, validate, and persist safe operational parameters atomically."""
         resp = self.client.get(CONFIG_ENDPOINT, authenticated=True)
         config = parse_remote_config(resp)
 
-        # Persist non-secret operational settings
-        self.queue.set_setting("remote_config_version", str(config.configuration_version))
-        self.queue.set_setting("server_device_id", config.device_id)
-        self.queue.set_setting("server_branch_id", config.branch_id)
-        self.queue.set_setting("stability_sample_seconds", str(config.stability_sample_seconds))
-        self.queue.set_setting("stability_required_samples", str(config.stability_required_samples))
-        self.queue.set_setting("stability_timeout_seconds", str(config.stability_timeout_seconds))
-        self.queue.set_setting("max_pdf_size_bytes", str(config.max_pdf_size_bytes))
-        self.queue.set_setting("default_phone_region", config.default_phone_region)
+        # Persist non-secret operational settings and version atomically
+        settings_to_persist = {
+            "server_device_id": config.device_id,
+            "server_branch_id": config.branch_id,
+            "stability_sample_seconds": str(config.stability_sample_seconds),
+            "stability_required_samples": str(config.stability_required_samples),
+            "stability_timeout_seconds": str(config.stability_timeout_seconds),
+            "max_pdf_size_bytes": str(config.max_pdf_size_bytes),
+            "default_phone_region": config.default_phone_region,
+            "remote_config_version": str(config.configuration_version),
+        }
+        self.queue.set_settings_atomic(settings_to_persist)
+
+        if on_applied is not None:
+            on_applied(config)
 
         logger.info(
             "Synchronized remote configuration version %d (branch_id=%s)",
@@ -349,6 +376,7 @@ class DeviceSyncManager:
         queue: JobQueue,
         installation_id: str,
         agent_version: str = "0.1.0",
+        on_config_applied: Callable[[RemoteConfig], None] | None = None,
     ) -> None:
         self.heartbeat_service = HeartbeatService(
             client=client,
@@ -360,8 +388,13 @@ class DeviceSyncManager:
             client=client,
             queue=queue,
         )
+        self.on_config_applied = on_config_applied
 
-    def perform_sync(self, service_state: str = "running") -> HeartbeatResult:
+    def perform_sync(
+        self,
+        service_state: str = "running",
+        on_config_applied: Callable[[RemoteConfig], None] | None = None,
+    ) -> HeartbeatResult:
         """Execute one complete sync cycle: send heartbeat and update configuration if newer version exists."""
         hb_result = self.heartbeat_service.send_heartbeat(service_state=service_state)
 
@@ -372,12 +405,10 @@ class DeviceSyncManager:
                 current_ver,
                 hb_result.configuration_version,
             )
+            callback = on_config_applied or self.on_config_applied
             try:
-                self.config_service.fetch_and_apply()
-            except ConfigValidationError as exc:
-                logger.warning(
-                    "Remote configuration validation failed; preserving local settings: %s",
-                    str(exc),
-                )
+                self.config_service.fetch_and_apply(on_applied=callback)
+            except ConfigValidationError:
+                logger.warning("Remote configuration validation failed; preserving local settings.")
 
         return hb_result

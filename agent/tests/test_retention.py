@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import datetime
 from datetime import timedelta, timezone
+import os
 import pathlib
+import stat
 import uuid
 import pytest
 
@@ -214,6 +216,7 @@ class TestSafePathVerification:
 
         ok, msg = is_safe_path_for_deletion(valid_file, [watch, archive, quarantine])
         assert ok is True
+        assert msg == "safe"
 
     def test_path_outside_allowed_folders_rejected(self, temp_dirs, tmp_path: pathlib.Path):
         watch, archive, quarantine = temp_dirs
@@ -224,7 +227,85 @@ class TestSafePathVerification:
 
         ok, msg = is_safe_path_for_deletion(outside_file, [watch, archive, quarantine])
         assert ok is False
-        assert "outside approved local folder boundaries" in msg
+        assert msg == "outside_allowed_boundaries"
+
+    def test_symlink_pointing_outside_approved_folder_rejected(self, temp_dirs, tmp_path: pathlib.Path):
+        watch, archive, quarantine = temp_dirs
+        outside_folder = tmp_path / "outside"
+        outside_folder.mkdir()
+        outside_target = outside_folder / "secret.txt"
+        outside_target.write_bytes(b"confidential")
+
+        symlink_path = watch / "traversal_link.pdf"
+        try:
+            symlink_path.symlink_to(outside_target)
+        except (OSError, NotImplementedError):
+            pytest.skip("Symlink creation not permitted or supported in this test environment.")
+
+        ok, msg = is_safe_path_for_deletion(symlink_path, [watch, archive, quarantine])
+        assert ok is False
+        assert msg == "symlink_rejected"
+        assert "/" not in msg and "\\" not in msg
+
+    def test_symlink_pointing_inside_approved_folder_rejected(self, temp_dirs):
+        watch, archive, quarantine = temp_dirs
+        target_file = watch / "real_report.pdf"
+        target_file.write_bytes(b"%PDF real report")
+
+        symlink_path = watch / "alias_link.pdf"
+        try:
+            symlink_path.symlink_to(target_file)
+        except (OSError, NotImplementedError):
+            pytest.skip("Symlink creation not permitted or supported in this test environment.")
+
+        ok, msg = is_safe_path_for_deletion(symlink_path, [watch, archive, quarantine])
+        assert ok is False
+        assert msg == "symlink_rejected"
+        assert "/" not in msg and "\\" not in msg
+
+    def test_windows_reparse_point_rejected(self, temp_dirs, monkeypatch):
+        import stat
+        watch, archive, quarantine = temp_dirs
+        test_file = watch / "reparse_test.pdf"
+        test_file.write_bytes(b"%PDF content")
+
+        real_lstat = os.lstat
+        def fake_lstat(path, *args, **kwargs):
+            st = real_lstat(path)
+            # Create a mock stat_result with FILE_ATTRIBUTE_REPARSE_POINT set
+            class MockStat:
+                st_mode = st.st_mode
+                st_file_attributes = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            return MockStat()
+
+        monkeypatch.setattr(os, "lstat", fake_lstat)
+        ok, msg = is_safe_path_for_deletion(test_file, [watch, archive, quarantine])
+        assert ok is False
+        assert msg == "reparse_point_rejected"
+        assert "/" not in msg and "\\" not in msg
+
+    def test_uninspectable_path_fails_closed(self, temp_dirs, monkeypatch):
+        watch, archive, quarantine = temp_dirs
+        test_file = watch / "error_test.pdf"
+        test_file.write_bytes(b"%PDF content")
+
+        def broken_lstat(path, *args, **kwargs):
+            raise OSError("Access denied simulation")
+
+        monkeypatch.setattr(os, "lstat", broken_lstat)
+        ok, msg = is_safe_path_for_deletion(test_file, [watch, archive, quarantine])
+        assert ok is False
+        assert msg == "path_inspection_failed"
+        assert "Access denied" not in msg
+
+    def test_directory_rejected_as_not_regular_file(self, temp_dirs):
+        watch, archive, quarantine = temp_dirs
+        subfolder = watch / "subfolder"
+        subfolder.mkdir()
+
+        ok, msg = is_safe_path_for_deletion(subfolder, [watch, archive, quarantine])
+        assert ok is False
+        assert msg == "not_regular_file"
 
 
 class TestCleanupService:

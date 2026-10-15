@@ -23,8 +23,16 @@ import threading
 import time
 from typing import Any
 
+from docflow_agent.client import ApiRateLimitError
 from docflow_agent.config import AgentConfig, load_config
 from docflow_agent.runtime import AgentRuntime
+from docflow_agent.sync import DeviceRevokedError
+from docflow_agent.token_manager import (
+    TokenAuthenticationError,
+    TokenReuseConflictError,
+    TokenRotationAmbiguousError,
+    TokenRateLimitedError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,14 +90,31 @@ class ServiceRunner:
                             service_state="paused" if self.runtime.is_paused else "running"
                         )
                         last_sync = now
+                    except DeviceRevokedError:
+                        logger.error("Device revoked or inactive in heartbeat. Pausing runtime operations.")
+                        self.runtime.is_paused = True
+                        last_sync = now
+                    except (TokenAuthenticationError, TokenReuseConflictError) as exc:
+                        logger.error("Authentication failure in heartbeat (%s). Pausing runtime operations.", exc.code)
+                        self.runtime.is_paused = True
+                        last_sync = now
+                    except TokenRotationAmbiguousError:
+                        logger.error("Token rotation ambiguous in heartbeat. Pausing runtime operations.")
+                        self.runtime.is_paused = True
+                        last_sync = now
+                    except (TokenRateLimitedError, ApiRateLimitError) as exc:
+                        retry_after = getattr(exc, "retry_after", None) or 60.0
+                        logger.warning("Heartbeat rate limited; backing off for %s seconds.", retry_after)
+                        last_sync = now + retry_after - sync_interval
                     except Exception as exc:
                         logger.warning("Heartbeat sync failed: %s", type(exc).__name__)
                         last_sync = now
 
-                # Process pending registration jobs
-                while self.runtime.process_next_registration_job():
-                    if self._stop_requested.is_set():
-                        break
+                # Process pending registration jobs ONLY if runtime is not paused
+                if not self.runtime.is_paused:
+                    while self.runtime.process_next_registration_job():
+                        if self._stop_requested.is_set():
+                            break
 
                 # Process pending source PDF cleanup candidates
                 try:

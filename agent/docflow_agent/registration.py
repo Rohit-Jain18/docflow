@@ -44,6 +44,15 @@ from docflow_agent.client import (
     ApiTimeoutError,
     ApiConnectionError,
     ApiPayloadError,
+    ApiRateLimitError,
+)
+from docflow_agent.sync import DeviceRevokedError
+from docflow_agent.token_manager import (
+    TokenError,
+    TokenAuthenticationError,
+    TokenReuseConflictError,
+    TokenRotationAmbiguousError,
+    TokenRateLimitedError,
 )
 from docflow_agent.queue import (
     JobQueue,
@@ -174,6 +183,49 @@ class ReportRegistrationService:
             )
             raise RegistrationConflictError("Idempotency conflict during report registration.") from exc
 
+        except ApiPermissionError as exc:
+            logger.error("Report registration rejected (403): Device or branch revoked/inactive.")
+            self.queue.update_status(
+                current_job.id,
+                JobStatus.RETRY_WAIT,
+                error_code="device_revoked",
+                increment_attempt=False,
+            )
+            raise DeviceRevokedError(detail="Device or branch revoked or inactive.", request_id=exc.request_id) from exc
+
+        except (TokenAuthenticationError, TokenReuseConflictError) as exc:
+            logger.error("Authentication failed during report registration: %s", exc.code)
+            self.queue.update_status(
+                current_job.id,
+                JobStatus.RETRY_WAIT,
+                error_code=exc.code,
+                increment_attempt=False,
+            )
+            raise
+
+        except TokenRotationAmbiguousError as exc:
+            logger.error("Token rotation ambiguous during report registration. Pausing for operator recovery.")
+            self.queue.update_status(
+                current_job.id,
+                JobStatus.RETRY_WAIT,
+                error_code="token_rotation_ambiguous",
+                increment_attempt=False,
+            )
+            raise
+
+        except (TokenRateLimitedError, ApiRateLimitError) as exc:
+            retry_after = getattr(exc, "retry_after", None) or 60.0
+            logger.warning("Rate limited during report registration; backing off for %s seconds.", retry_after)
+            next_attempt_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=retry_after)
+            self.queue.update_status(
+                current_job.id,
+                JobStatus.RETRY_WAIT,
+                error_code="rate_limited",
+                next_attempt_at=next_attempt_dt.isoformat(),
+                increment_attempt=False,
+            )
+            raise
+
         except ApiResponseError as exc:
             if exc.code == "account_not_verified" or exc.status_code == 422:
                 logger.warning(
@@ -207,56 +259,112 @@ class ReportRegistrationService:
                 current_job.id,
                 JobStatus.RETRY_WAIT,
                 error_code="network_timeout",
+                increment_attempt=False,
                 details={"reason": type(exc).__name__},
             )
             raise
 
-        # 5. Parse and validate response
+        # 5. Parse and validate response strictly without raw input leakage
         if not isinstance(resp, dict):
             self.queue.update_status(
                 current_job.id,
                 JobStatus.RETRY_WAIT,
-                error_code="malformed_response",
+                error_code="malformed_registration_response",
+                increment_attempt=False,
             )
             raise ApiPayloadError("Server returned non-dictionary response for report registration.")
 
         report_id = resp.get("report_id")
         server_status = resp.get("status")
-        is_duplicate = bool(resp.get("duplicate", False))
+        duplicate_val = resp.get("duplicate")
         created_at = resp.get("created_at")
 
+        # Required status == "queued"
+        if server_status != "queued":
+            self.queue.update_status(
+                current_job.id,
+                JobStatus.RETRY_WAIT,
+                error_code="malformed_registration_response",
+                increment_attempt=False,
+            )
+            raise ApiPayloadError("Report registration response status is invalid; expected 'queued'.")
+
+        # Required report_id must be valid UUID string
         if not report_id or not isinstance(report_id, str):
+            self.queue.update_status(
+                current_job.id,
+                JobStatus.RETRY_WAIT,
+                error_code="malformed_registration_response",
+                increment_attempt=False,
+            )
             raise ApiPayloadError("Report registration response missing valid 'report_id'.")
         try:
-            uuid.UUID(report_id)
-        except (ValueError, TypeError) as exc:
-            raise ApiPayloadError(f"Invalid UUID in 'report_id': {report_id}") from exc
+            parsed_uuid = uuid.UUID(report_id)
+            canonical_report_id = str(parsed_uuid)
+        except (ValueError, TypeError):
+            self.queue.update_status(
+                current_job.id,
+                JobStatus.RETRY_WAIT,
+                error_code="malformed_registration_response",
+                increment_attempt=False,
+            )
+            raise ApiPayloadError("Report registration response missing valid UUID 'report_id'.") from None
 
+        # Required duplicate must be an actual boolean (no coercion)
+        if not isinstance(duplicate_val, bool):
+            self.queue.update_status(
+                current_job.id,
+                JobStatus.RETRY_WAIT,
+                error_code="malformed_registration_response",
+                increment_attempt=False,
+            )
+            raise ApiPayloadError("Report registration response missing valid boolean 'duplicate'.")
+
+        # Required created_at must be strict UTC ISO 8601 ending in Z and calendar-valid
         if not created_at or not isinstance(created_at, str) or not _ISO8601_UTC_Z_REGEX.match(created_at):
+            self.queue.update_status(
+                current_job.id,
+                JobStatus.RETRY_WAIT,
+                error_code="malformed_registration_response",
+                increment_attempt=False,
+            )
             raise ApiPayloadError("Report registration response missing valid UTC Z 'created_at'.")
+        try:
+            iso_clean = created_at[:-1] + "+00:00"
+            dt = datetime.datetime.fromisoformat(iso_clean)
+            if dt.tzinfo is None:
+                raise ValueError
+        except (ValueError, TypeError):
+            self.queue.update_status(
+                current_job.id,
+                JobStatus.RETRY_WAIT,
+                error_code="malformed_registration_response",
+                increment_attempt=False,
+            )
+            raise ApiPayloadError("Report registration response 'created_at' is not a calendar-valid UTC timestamp.")
 
-        # 6. Success: Persist report_id and advance lifecycle state to METADATA_REGISTERED
+        # 6. Success: Persist canonical_report_id and advance lifecycle state to METADATA_REGISTERED
         self.queue.update_status(
             current_job.id,
             JobStatus.METADATA_REGISTERED,
-            docflow_report_id=report_id,
+            docflow_report_id=canonical_report_id,
             details={
                 "action": "metadata_registered",
-                "report_id": report_id,
-                "duplicate": is_duplicate,
+                "report_id": canonical_report_id,
+                "duplicate": duplicate_val,
             },
         )
 
         logger.info(
             "Report metadata successfully registered: job=%s, report_id=%s, duplicate=%s",
             current_job.id,
-            report_id,
-            is_duplicate,
+            canonical_report_id,
+            duplicate_val,
         )
 
         return RegistrationResult(
-            report_id=report_id,
-            status=server_status or "queued",
-            is_duplicate=is_duplicate,
+            report_id=canonical_report_id,
+            status=server_status,
+            is_duplicate=duplicate_val,
             created_at=created_at,
         )

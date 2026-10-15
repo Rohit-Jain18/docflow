@@ -311,3 +311,225 @@ class TestServiceRunner:
         runner.stop()
         exit_code = runner.run()
         assert exit_code == 0
+
+    def test_runtime_registration_403_pauses_and_preserves_job(self, temp_env):
+        config, store, watch = temp_env
+        queue = JobQueue.from_config(config)
+
+        pdf = watch / "919876543210.pdf"
+        pdf.write_bytes(b"%PDF-1.4 sample")
+        val = ValidationResult(
+            is_valid=True,
+            source_path=pdf,
+            source_basename="919876543210.pdf",
+            recipient_phone_e164="+919876543210",
+            content_sha256="6" * 64,
+            file_size_bytes=100,
+            mtime_ns=100,
+        )
+        enq = queue.enqueue(val, branch_id=str(uuid.uuid4()))
+
+        call_count = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            return httpx.Response(
+                403,
+                json={
+                    "type": "about:blank",
+                    "title": "Forbidden",
+                    "status": 403,
+                    "code": "permission_denied",
+                    "detail": "Device is revoked.",
+                },
+            )
+
+        client = _make_client(handler)
+        runtime = AgentRuntime(config, credential_store=store, queue=queue, client=client)
+
+        assert runtime.is_paused is False
+        processed = runtime.process_next_registration_job()
+        assert processed is False
+        assert call_count == 1
+
+        # Runtime is paused
+        assert runtime.is_paused is True
+
+        # Job is preserved in RETRY_WAIT, not FAILED, no terminal cleanup armed
+        job = queue.get_job(enq.job.id)
+        assert job is not None
+        assert job.status == JobStatus.RETRY_WAIT.value
+        assert job.last_error_code == "device_revoked"
+        assert job.cleanup_eligible_at is None
+        assert job.lease_owner is None
+
+        # Subsequent call must not send any network request
+        processed2 = runtime.process_next_registration_job()
+        assert processed2 is False
+        assert call_count == 1
+
+    def test_runtime_token_errors_pause_and_preserve_job(self, temp_env):
+        import dataclasses
+        from docflow_agent.token_manager import (
+            TokenAuthenticationError,
+            TokenReuseConflictError,
+            TokenRotationAmbiguousError,
+        )
+        config, store, watch = temp_env
+
+        for i, (exc_to_raise, expected_code) in enumerate([
+            (TokenAuthenticationError("auth_failed"), "token_error"),
+            (TokenReuseConflictError("reuse_conflict"), "token_error"),
+            (TokenRotationAmbiguousError("Ambiguous token rotation outcome"), "token_rotation_ambiguous"),
+        ]):
+            db_path = watch.parent / f"token_err_{i}.db"
+            iter_config = dataclasses.replace(config, db_path=str(db_path))
+            queue = JobQueue.from_config(iter_config)
+            pdf = watch / f"91987654321{i}.pdf"
+            pdf.write_bytes(b"%PDF-1.4 sample")
+            val = ValidationResult(
+                is_valid=True,
+                source_path=pdf,
+                source_basename=f"91987654321{i}.pdf",
+                recipient_phone_e164=f"+91987654321{i}",
+                content_sha256=f"{i}" * 64,
+                file_size_bytes=100,
+                mtime_ns=100,
+            )
+            enq = queue.enqueue(val, branch_id=str(uuid.uuid4()))
+
+            call_count = 0
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                nonlocal call_count
+                call_count += 1
+                raise exc_to_raise
+
+            client = _make_client(handler)
+            runtime = AgentRuntime(iter_config, credential_store=store, queue=queue, client=client)
+
+            assert runtime.is_paused is False
+            processed = runtime.process_next_registration_job()
+            assert processed is False
+            assert call_count == 1
+            assert runtime.is_paused is True
+
+            job = queue.get_job(enq.job.id)
+            assert job is not None
+            assert job.status == JobStatus.RETRY_WAIT.value
+            assert job.cleanup_eligible_at is None
+            assert job.lease_owner is None
+
+            # Subsequent call does nothing while paused
+            assert runtime.process_next_registration_job() is False
+            assert call_count == 1
+
+    def test_runtime_rate_limiting_pauses_and_preserves_job(self, temp_env):
+        from docflow_agent.token_manager import TokenRateLimitedError
+        config, store, watch = temp_env
+        queue = JobQueue.from_config(config)
+
+        pdf = watch / "919876543210.pdf"
+        pdf.write_bytes(b"%PDF-1.4 sample")
+        val = ValidationResult(
+            is_valid=True,
+            source_path=pdf,
+            source_basename="919876543210.pdf",
+            recipient_phone_e164="+919876543210",
+            content_sha256="8" * 64,
+            file_size_bytes=100,
+            mtime_ns=100,
+        )
+        enq = queue.enqueue(val, branch_id=str(uuid.uuid4()))
+
+        call_count = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            raise TokenRateLimitedError("Rate limit reached", retry_after=30)
+
+        client = _make_client(handler)
+        runtime = AgentRuntime(config, credential_store=store, queue=queue, client=client)
+
+        processed = runtime.process_next_registration_job()
+        assert processed is False
+        assert call_count == 1
+        assert runtime.is_paused is True
+
+        job = queue.get_job(enq.job.id)
+        assert job is not None
+        assert job.status == JobStatus.RETRY_WAIT.value
+        assert job.next_attempt_at is not None
+        assert job.cleanup_eligible_at is None
+        assert job.lease_owner is None
+
+        # Subsequent call does nothing while rate-limited
+        assert runtime.process_next_registration_job() is False
+        assert call_count == 1
+
+    def test_service_runner_heartbeat_403_pauses_runtime(self, temp_env):
+        config, store, watch = temp_env
+        queue = JobQueue.from_config(config)
+
+        pdf = watch / "919876543210.pdf"
+        pdf.write_bytes(b"%PDF-1.4 sample")
+        val = ValidationResult(
+            is_valid=True,
+            source_path=pdf,
+            source_basename="919876543210.pdf",
+            recipient_phone_e164="+919876543210",
+            content_sha256="9" * 64,
+            file_size_bytes=100,
+            mtime_ns=100,
+        )
+        enq = queue.enqueue(val, branch_id=str(uuid.uuid4()))
+
+        registration_called = False
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal registration_called
+            if request.url.path == "/api/v1/agent/heartbeat":
+                return httpx.Response(
+                    403,
+                    json={
+                        "type": "about:blank",
+                        "title": "Forbidden",
+                        "status": 403,
+                        "code": "permission_denied",
+                        "detail": "Device is revoked.",
+                    },
+                )
+            elif request.url.path == "/api/v1/agent/reports":
+                registration_called = True
+                return httpx.Response(202, json={})
+            return httpx.Response(404)
+
+        client = _make_client(handler)
+        runner = ServiceRunner(config=config, poll_interval_seconds=0.05)
+        runner.runtime.client = client
+        runner.runtime.sync_manager.client = client
+        runner.runtime.registration_service.client = client
+
+        # Stop after 1 iteration
+        def delayed_stop():
+            import time
+            time.sleep(0.15)
+            runner.stop()
+
+        import threading
+        t = threading.Thread(target=delayed_stop)
+        t.start()
+
+        runner.run()
+        t.join()
+
+        # Proves runtime was paused and registration was NEVER called!
+        assert runner.runtime.is_paused is True
+        assert registration_called is False
+
+        # Job was preserved
+        job = runner.runtime.queue.get_job(enq.job.id)
+        assert job is not None
+        assert job.status in (JobStatus.VALIDATED.value, JobStatus.RETRY_WAIT.value)

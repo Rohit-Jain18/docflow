@@ -450,3 +450,194 @@ class TestDeviceSyncManager:
         assert res.configuration_version == 2
         # Only heartbeat was called; config was skipped!
         assert calls == ["/api/v1/agent/heartbeat"]
+
+    def test_heartbeat_canary_sanitization(self, queue: JobQueue, caplog: pytest.LogCaptureFixture):
+        import sqlite3
+        canary_status = "CANARY_STATUS_+919876543210_PATIENT_DO_NOT_LEAK"
+        canary_time = "CANARY_TIME_REPORT_DATA_SECRET"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "server_time": canary_time,
+                    "configuration_version": 1,
+                    "device_status": canary_status,
+                },
+            )
+
+        client = _make_client(handler)
+        service = HeartbeatService(client=client, queue=queue, installation_id=str(uuid.uuid4()))
+
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(Exception) as exc_info:
+                service.send_heartbeat()
+
+        exc_str = str(exc_info.value)
+        exc_repr = repr(exc_info.value)
+        log_text = caplog.text
+
+        assert canary_time not in exc_str
+        assert canary_time not in exc_repr
+        assert canary_time not in log_text
+
+        # Also test canary status when server_time is valid
+        def handler_status(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "server_time": "2026-10-15T12:00:00Z",
+                    "configuration_version": 1,
+                    "device_status": canary_status,
+                },
+            )
+
+        client2 = _make_client(handler_status)
+        service2 = HeartbeatService(client=client2, queue=queue, installation_id=str(uuid.uuid4()))
+
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(DeviceRevokedError) as exc_info2:
+                service2.send_heartbeat()
+
+        assert canary_status not in str(exc_info2.value)
+        assert canary_status not in repr(exc_info2.value)
+        assert canary_status not in caplog.text
+
+    def test_config_sync_canary_sanitization(self, caplog: pytest.LogCaptureFixture):
+        canary_region = "CANARY_REGION_+919876543210_PATIENT_ID_SECRET"
+        payload = {
+            "device_id": str(uuid.uuid4()),
+            "branch_id": str(uuid.uuid4()),
+            "configuration_version": 1,
+            "default_phone_region": canary_region,
+            "stability_sample_seconds": 2,
+            "stability_required_samples": 3,
+            "stability_timeout_seconds": 120,
+            "max_pdf_size_bytes": 52428800,
+        }
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(ConfigValidationError) as exc_info:
+                parse_remote_config(payload)
+
+        assert canary_region not in str(exc_info.value)
+        assert canary_region not in repr(exc_info.value)
+        assert canary_region not in caplog.text
+
+    def test_fetch_and_apply_atomic_failure_retains_previous_settings(self, queue: JobQueue, monkeypatch):
+        import sqlite3
+        queue.set_settings_atomic({
+            "remote_config_version": "1",
+            "stability_sample_seconds": "2",
+            "max_pdf_size_bytes": "10000000",
+        })
+        assert queue.get_setting("remote_config_version") == "1"
+        assert queue.get_setting("stability_sample_seconds") == "2"
+
+        device_id = str(uuid.uuid4())
+        branch_id = str(uuid.uuid4())
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "device_id": device_id,
+                    "branch_id": branch_id,
+                    "configuration_version": 2,
+                    "default_phone_region": "IN",
+                    "stability_sample_seconds": 5,
+                    "stability_required_samples": 4,
+                    "stability_timeout_seconds": 150,
+                    "max_pdf_size_bytes": 20000000,
+                },
+            )
+
+        client = _make_client(handler)
+        service = ConfigSyncService(client=client, queue=queue)
+
+        def failing_atomic(settings_dict):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(queue, "set_settings_atomic", failing_atomic)
+
+        applied_called = []
+        with pytest.raises(sqlite3.OperationalError):
+            service.fetch_and_apply(on_applied=lambda cfg: applied_called.append(cfg))
+
+        assert len(applied_called) == 0
+        assert queue.get_setting("remote_config_version") == "1"
+        assert queue.get_setting("stability_sample_seconds") == "2"
+        assert queue.get_setting("max_pdf_size_bytes") == "10000000"
+
+    def test_fetch_and_apply_malformed_config_retains_previous_settings(self, queue: JobQueue):
+        queue.set_settings_atomic({
+            "remote_config_version": "1",
+            "stability_sample_seconds": "2",
+        })
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "device_id": "bad-uuid",
+                    "configuration_version": "not-an-int",
+                },
+            )
+
+        client = _make_client(handler)
+        service = ConfigSyncService(client=client, queue=queue)
+
+        applied_called = []
+        with pytest.raises(Exception):
+            service.fetch_and_apply(on_applied=lambda cfg: applied_called.append(cfg))
+
+        assert len(applied_called) == 0
+        assert queue.get_setting("remote_config_version") == "1"
+        assert queue.get_setting("stability_sample_seconds") == "2"
+
+    def test_sync_manager_updates_live_candidate_processing_callback(self, queue: JobQueue):
+        installation_id = str(uuid.uuid4())
+        device_id = str(uuid.uuid4())
+        branch_id = str(uuid.uuid4())
+
+        applied_configs = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v1/agent/heartbeat":
+                return httpx.Response(
+                    200,
+                    json={
+                        "server_time": "2026-10-15T12:00:00Z",
+                        "configuration_version": 3,
+                        "device_status": "active",
+                    },
+                )
+            elif request.url.path == "/api/v1/agent/config":
+                return httpx.Response(
+                    200,
+                    json={
+                        "device_id": device_id,
+                        "branch_id": branch_id,
+                        "configuration_version": 3,
+                        "default_phone_region": "IN",
+                        "stability_sample_seconds": 4,
+                        "stability_required_samples": 5,
+                        "stability_timeout_seconds": 180,
+                        "max_pdf_size_bytes": 10485760,
+                    },
+                )
+            return httpx.Response(404)
+
+        client = _make_client(handler)
+        manager = DeviceSyncManager(
+            client=client,
+            queue=queue,
+            installation_id=installation_id,
+            on_config_applied=lambda cfg: applied_configs.append(cfg),
+        )
+
+        manager.perform_sync()
+        assert len(applied_configs) == 1
+        assert applied_configs[0].configuration_version == 3
+        assert applied_configs[0].max_pdf_size_bytes == 10485760
+        assert queue.get_setting("remote_config_version") == "3"

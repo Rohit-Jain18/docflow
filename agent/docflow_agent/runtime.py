@@ -19,6 +19,7 @@ Responsibilities:
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 from datetime import timezone
 import logging
@@ -38,6 +39,7 @@ from docflow_agent.client import (
     ApiTimeoutError,
     ApiConnectionError,
     ApiRateLimitError,
+    ApiPayloadError,
 )
 from docflow_agent.config import AgentConfig
 from docflow_agent.credentials import CredentialStore, get_credential_store
@@ -45,7 +47,10 @@ from docflow_agent.queue import (
     JobQueue,
     JobRecord,
     JobStatus,
+    EnqueueResult,
     create_watcher_enqueue_adapter,
+    process_candidate_file,
+    handle_watcher_result,
 )
 from docflow_agent.registration import (
     ReportRegistrationService,
@@ -59,8 +64,16 @@ from docflow_agent.sync import (
     DeviceSyncManager,
     DeviceRevokedError,
     HeartbeatResult,
+    RemoteConfig,
 )
-from docflow_agent.token_manager import TokenManager
+from docflow_agent.token_manager import (
+    TokenManager,
+    TokenError,
+    TokenAuthenticationError,
+    TokenReuseConflictError,
+    TokenRotationAmbiguousError,
+    TokenRateLimitedError,
+)
 from docflow_agent.watcher import Watcher
 
 logger = logging.getLogger(__name__)
@@ -88,6 +101,17 @@ def calculate_backoff_delay(
     return bounded_delay
 
 
+@dataclasses.dataclass
+class LiveProcessingConfig:
+    """Live operational parameters applied dynamically to candidate processing."""
+
+    max_size_bytes: int
+    default_region: str
+    sample_interval_seconds: float
+    required_samples: int
+    timeout_seconds: float
+
+
 class AgentRuntime:
     """Central runtime orchestrating the Windows Agent components."""
 
@@ -106,9 +130,20 @@ class AgentRuntime:
         self.config = config
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
         self.max_retry_attempts = max(1, int(max_retry_attempts))
-        self.is_paused = False
+        self._is_paused = False
+        self._pause_until = 0.0
         self._stop_event = threading.Event()
         self._active_leases: set[str] = set()
+
+        # Dynamic operational configuration for live candidate processing
+        self._config_lock = threading.Lock()
+        self._live_config = LiveProcessingConfig(
+            max_size_bytes=config.max_pdf_size_bytes,
+            default_region=config.phone_default_region,
+            sample_interval_seconds=float(config.stability_sample_seconds),
+            required_samples=config.stability_required_samples,
+            timeout_seconds=float(config.stability_timeout_seconds),
+        )
 
         # 1. Credential store
         self.store = credential_store or get_credential_store()
@@ -149,6 +184,7 @@ class AgentRuntime:
             client=self.client,
             queue=self.queue,
             installation_id=self.installation_id,
+            on_config_applied=self.apply_remote_config,
         )
         self.registration_service = ReportRegistrationService(
             client=self.client,
@@ -165,22 +201,62 @@ class AgentRuntime:
             allowed_folders=allowed_dirs,
         )
 
-        # 6. Folder Watcher with enqueue adapter
-        enqueue_cb = create_watcher_enqueue_adapter(
-            self.queue,
-            branch_id=self.branch_id,
-            watch_folder=config.watch_folder,
-            quarantine_folder=config.quarantine_folder,
-            max_size_bytes=config.max_pdf_size_bytes,
-            default_region=config.phone_default_region,
-            sample_interval_seconds=float(config.stability_sample_seconds),
-            required_samples=config.stability_required_samples,
-            timeout_seconds=float(config.stability_timeout_seconds),
-        )
+        # 6. Folder Watcher with live dynamic enqueue adapter
+        def dynamic_enqueue_cb(path: pathlib.Path | str) -> EnqueueResult | None:
+            with self._config_lock:
+                cfg = self._live_config
+                max_bytes = cfg.max_size_bytes
+                region = cfg.default_region
+                s_interval = cfg.sample_interval_seconds
+                req_samples = cfg.required_samples
+                timeout_sec = cfg.timeout_seconds
+
+            stab, val, quar = process_candidate_file(
+                path,
+                watch_folder=self.config.watch_folder,
+                quarantine_folder=self.config.quarantine_folder,
+                max_size_bytes=max_bytes,
+                default_region=region,
+                sample_interval_seconds=s_interval,
+                required_samples=req_samples,
+                timeout_seconds=timeout_sec,
+            )
+            return handle_watcher_result(self.queue, self.branch_id, stab, val, quar)
+
         self.watcher = Watcher(
             watch_folder=config.watch_folder,
-            on_candidate=enqueue_cb,
+            on_candidate=dynamic_enqueue_cb,
             rescan_interval_seconds=float(config.stability_sample_seconds * 5),
+        )
+
+    @property
+    def is_paused(self) -> bool:
+        """Indicates if runtime processing is paused permanently or during rate-limit backoff."""
+        if self._is_paused:
+            return True
+        if self._pause_until > time.time():
+            return True
+        return False
+
+    @is_paused.setter
+    def is_paused(self, val: bool) -> None:
+        self._is_paused = bool(val)
+
+    def apply_remote_config(self, remote_config: RemoteConfig) -> None:
+        """Safely apply validated remote configuration to live candidate-processing behavior."""
+        with self._config_lock:
+            self._live_config = LiveProcessingConfig(
+                max_size_bytes=remote_config.max_pdf_size_bytes,
+                default_region=remote_config.default_phone_region,
+                sample_interval_seconds=float(remote_config.stability_sample_seconds),
+                required_samples=remote_config.stability_required_samples,
+                timeout_seconds=float(remote_config.stability_timeout_seconds),
+            )
+        if hasattr(self, "watcher") and self.watcher is not None:
+            self.watcher.rescan_interval_seconds = float(remote_config.stability_sample_seconds * 5)
+        logger.info(
+            "Applied remote configuration version %d to live watcher pipeline.",
+            remote_config.configuration_version,
         )
 
     def startup_recovery(self) -> dict[str, int]:
@@ -202,6 +278,26 @@ class AgentRuntime:
             "recovered_leases": recovered_leases,
             "rescanned_count": rescanned_count,
         }
+
+    def _recover_job_on_auth_pause(
+        self,
+        job: JobRecord,
+        error_code: str,
+        retry_after: float | None = None,
+    ) -> None:
+        """Recover an in-flight job interrupted by global auth/revocation failure without failing or arming cleanup."""
+        next_attempt = None
+        if retry_after is not None and retry_after > 0:
+            next_dt = datetime.datetime.now(timezone.utc) + datetime.timedelta(seconds=retry_after)
+            next_attempt = next_dt.isoformat()
+
+        self.queue.update_status(
+            job.id,
+            JobStatus.RETRY_WAIT,
+            error_code=error_code,
+            next_attempt_at=next_attempt,
+            increment_attempt=False,
+        )
 
     def process_next_registration_job(self) -> bool:
         """Claim and process the next eligible job for metadata registration."""
@@ -252,9 +348,53 @@ class AgentRuntime:
                 )
             return False
 
-        except DeviceRevokedError as exc:
+        except ApiPayloadError as exc:
+            # Malformed response from server: retry with same request/idempotency key
+            logger.warning("Malformed response for job %s; retrying with same key.", job.id)
+            attempt = job.attempt_count + 1
+            if attempt >= self.max_retry_attempts:
+                logger.error("Job %s exhausted retry budget (%d attempts). Marking FAILED.", job.id, attempt)
+                self.queue.update_status(
+                    job.id,
+                    JobStatus.FAILED,
+                    error_code="retry_budget_exhausted",
+                    increment_attempt=True,
+                )
+            else:
+                delay = calculate_backoff_delay(attempt)
+                next_attempt_dt = datetime.datetime.now(timezone.utc) + datetime.timedelta(seconds=delay)
+                self.queue.update_status(
+                    job.id,
+                    JobStatus.RETRY_WAIT,
+                    error_code="malformed_registration_response",
+                    next_attempt_at=next_attempt_dt.isoformat(),
+                    increment_attempt=True,
+                )
+            return False
+
+        except (DeviceRevokedError, ApiPermissionError) as exc:
             logger.error("Device revoked or inactive. Pausing runtime operations.")
             self.is_paused = True
+            self._recover_job_on_auth_pause(job, error_code="device_revoked")
+            return False
+
+        except (TokenAuthenticationError, TokenReuseConflictError) as exc:
+            logger.error("Authentication failed (%s). Pausing runtime operations.", exc.code)
+            self.is_paused = True
+            self._recover_job_on_auth_pause(job, error_code=exc.code)
+            return False
+
+        except TokenRotationAmbiguousError as exc:
+            logger.error("Token rotation ambiguous. Pausing runtime operations for operator recovery.")
+            self.is_paused = True
+            self._recover_job_on_auth_pause(job, error_code="token_rotation_ambiguous")
+            return False
+
+        except (TokenRateLimitedError, ApiRateLimitError) as exc:
+            retry_after = getattr(exc, "retry_after", None) or 60.0
+            logger.warning("Token or API rate limit reached. Pausing for %s seconds.", retry_after)
+            self._pause_until = time.time() + retry_after
+            self._recover_job_on_auth_pause(job, error_code="rate_limited", retry_after=retry_after)
             return False
 
         except RegistrationConflictError as exc:
@@ -262,7 +402,7 @@ class AgentRuntime:
             return False
 
         except Exception as exc:
-            logger.exception("Unexpected error processing job %s: %s", job.id, type(exc).__name__)
+            logger.error("Unexpected error processing job %s: %s", job.id, type(exc).__name__)
             self.queue.update_status(
                 job.id,
                 JobStatus.FAILED,
@@ -284,15 +424,21 @@ class AgentRuntime:
             )
         except DeviceRevokedError:
             self.is_paused = True
+        except (TokenAuthenticationError, TokenReuseConflictError, TokenRotationAmbiguousError):
+            self.is_paused = True
+        except (TokenRateLimitedError, ApiRateLimitError) as exc:
+            retry_after = getattr(exc, "retry_after", None) or 60.0
+            self._pause_until = time.time() + retry_after
         except Exception as exc:
             logger.warning("Periodic sync failed: %s", type(exc).__name__)
 
-        # 2. Registration Sweep (process all currently ready jobs)
+        # 2. Registration Sweep (process all currently ready jobs ONLY if not paused)
         registered_count = 0
-        while self.process_next_registration_job():
-            registered_count += 1
-            if self._stop_event.is_set():
-                break
+        if not self.is_paused:
+            while self.process_next_registration_job():
+                registered_count += 1
+                if self._stop_event.is_set():
+                    break
 
         # 3. Cleanup Sweep
         cleaned_count = self.cleanup_service.process_cleanup_candidates()
