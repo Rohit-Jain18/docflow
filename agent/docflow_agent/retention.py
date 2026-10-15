@@ -62,6 +62,7 @@ ALLOWED_TERMINAL_CLEANUP_STATUSES = frozenset({
 BLOCKING_OPERATION_STATUSES = frozenset({
     JobStatus.DISCOVERED.value,
     JobStatus.WAITING_STABILITY.value,
+    JobStatus.QUEUED.value,
     JobStatus.VALIDATED.value,
     JobStatus.METADATA_REGISTERING.value,
     JobStatus.METADATA_REGISTERED.value,

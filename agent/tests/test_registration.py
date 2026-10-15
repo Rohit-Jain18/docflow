@@ -266,6 +266,36 @@ class TestReportRegistrationService:
         with pytest.raises(RegistrationError):
             service.register_job(failed_job)
 
+    def test_registration_from_queued_starting_state(self, queue: JobQueue, sample_job):
+        job, branch_id = sample_job
+        queue.update_status(job.id, JobStatus.QUEUED)
+        queued_job = queue.get_job(job.id)
+        assert queued_job is not None
+        assert queued_job.status == JobStatus.QUEUED.value
+
+        server_report_id = str(uuid.uuid4())
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                202,
+                json={
+                    "report_id": server_report_id,
+                    "status": "queued",
+                    "duplicate": False,
+                    "created_at": "2026-10-15T12:00:00Z",
+                },
+            )
+
+        client = _make_client(handler)
+        service = ReportRegistrationService(client=client, queue=queue, branch_id=branch_id)
+
+        res = service.register_job(queued_job)
+        assert res.report_id == server_report_id
+        updated = queue.get_job(job.id)
+        assert updated is not None
+        assert updated.status == JobStatus.METADATA_REGISTERED.value
+
+
     @pytest.mark.parametrize(
         "invalid_body,error_substr",
         [

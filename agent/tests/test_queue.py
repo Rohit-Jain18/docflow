@@ -756,3 +756,21 @@ class TestLogPrivacy:
             assert full_path not in msg
             # Sensitive basename bearing phone must not appear in logs
             assert basename not in msg
+
+    def test_queued_status_claimable_and_transitionable(self, tmp_path: pathlib.Path) -> None:
+        queue = JobQueue(tmp_path / "q_status.db")
+        val = _mock_validation_result(tmp_path, phone_number="+919876543210")
+        enq = queue.enqueue(val, branch_id="b1")
+
+        # Can transition to QUEUED
+        job = queue.update_status(enq.job.id, JobStatus.QUEUED)
+        assert job.status == JobStatus.QUEUED.value
+
+        # QUEUED jobs are claimable by default
+        claimed = queue.claim_job("worker-test")
+        assert claimed is not None
+        assert claimed.id == enq.job.id
+
+        # Can transition from QUEUED to METADATA_REGISTERING
+        registered_job = queue.update_status(claimed.id, JobStatus.METADATA_REGISTERING)
+        assert registered_job.status == JobStatus.METADATA_REGISTERING.value

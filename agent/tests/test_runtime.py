@@ -533,3 +533,242 @@ class TestServiceRunner:
         job = runner.runtime.queue.get_job(enq.job.id)
         assert job is not None
         assert job.status in (JobStatus.VALIDATED.value, JobStatus.RETRY_WAIT.value)
+
+    def test_end_to_end_watcher_to_registration_and_duplicate_events(self, temp_env):
+        config, store, watch = temp_env
+        server_report_id = str(uuid.uuid4())
+        recorded_requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v1/agent/reports":
+                recorded_requests.append({
+                    "method": request.method,
+                    "path": request.url.path,
+                    "idempotency_key": request.headers.get("Idempotency-Key"),
+                    "body": json.loads(request.content.decode("utf-8")),
+                })
+                return httpx.Response(
+                    202,
+                    json={
+                        "report_id": server_report_id,
+                        "status": "queued",
+                        "duplicate": False,
+                        "created_at": "2026-10-15T12:00:00Z",
+                    },
+                )
+            return httpx.Response(404)
+
+        client = _make_client(handler)
+        runtime = AgentRuntime(config, credential_store=store, client=client)
+
+        # 1. Create a valid PDF in the watch folder
+        pdf_file = watch / "919876543210.pdf"
+        valid_pdf_content = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n"
+        pdf_file.write_bytes(valid_pdf_content)
+
+        # 2. Trigger candidate processing through the real runtime watcher candidate callback
+        assert runtime.watcher.on_candidate is not None
+        enq_res = runtime.watcher.on_candidate(pdf_file)
+
+        assert enq_res is not None
+        assert enq_res.is_duplicate is False
+        job_id = enq_res.job.id
+
+        # 3. Confirm newly accepted job reaches an eligible status in SQLite queue
+        enqueued_job = runtime.queue.get_job(job_id)
+        assert enqueued_job is not None
+        assert enqueued_job.status in (JobStatus.VALIDATED.value, JobStatus.QUEUED.value)
+        assert enqueued_job.status == JobStatus.VALIDATED.value
+        assert enqueued_job.recipient_phone_e164 == "+919876543210"
+        assert enqueued_job.lease_owner is None
+
+        # 4. Process the job via AgentRuntime.process_next_registration_job()
+        processed = runtime.process_next_registration_job()
+        assert processed is True
+
+        # 5. Verify the job was claimed and reached the mocked registration endpoint
+        assert len(recorded_requests) == 1
+        req = recorded_requests[0]
+        assert req["body"]["recipient_phone_e164"] == "+919876543210"
+        assert req["body"]["document_type"] == "diagnostic_report"
+        assert req["idempotency_key"] == enqueued_job.idempotency_key
+
+        # 6. Verify job progressed to METADATA_REGISTERED, stored docflow_report_id, released lease
+        registered_job = runtime.queue.get_job(job_id)
+        assert registered_job is not None
+        assert registered_job.status == JobStatus.METADATA_REGISTERED.value
+        assert registered_job.docflow_report_id == server_report_id
+        assert registered_job.lease_owner is None
+        assert registered_job.cleanup_eligible_at is None
+
+        # 7. Duplicate watcher events: re-run candidate callback on same file
+        dup_res = runtime.watcher.on_candidate(pdf_file)
+        assert dup_res is not None
+        assert dup_res.is_duplicate is True
+        assert dup_res.job.id == job_id
+
+        # Database still contains exactly 1 job
+        all_jobs = runtime.queue.list_jobs()
+        assert len(all_jobs) == 1
+
+        # Audit event records duplicate observation
+        events = runtime.queue.list_events(job_id)
+        event_types = [e.event_type for e in events]
+        assert "duplicate_fingerprint_observed" in event_types
+
+        # 8. Restart / recovery test: simulate an unreleased/expired lease on a new job
+        pdf2 = watch / "919876543211.pdf"
+        pdf2.write_bytes(valid_pdf_content)
+        enq2 = runtime.watcher.on_candidate(pdf2)
+        assert enq2 is not None
+
+        past_iso = (datetime.datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        with runtime.queue._write_transaction() as conn:
+            conn.execute(
+                "UPDATE jobs SET lease_owner = 'crashed_worker', lease_expires_at = ? WHERE id = ?;",
+                (past_iso, enq2.job.id),
+            )
+
+        # Simulate fresh runtime startup recovery
+        fresh_runtime = AgentRuntime(config, credential_store=store, client=client)
+        recovery_summary = fresh_runtime.startup_recovery()
+        assert recovery_summary["recovered_leases"] >= 1
+
+        recovered_job = fresh_runtime.queue.get_job(enq2.job.id)
+        assert recovered_job is not None
+        assert recovered_job.lease_owner is None
+
+        # Fresh runtime can claim and register the recovered job
+        assert fresh_runtime.process_next_registration_job() is True
+        assert fresh_runtime.queue.get_job(enq2.job.id).status == JobStatus.METADATA_REGISTERED.value
+
+    def test_runtime_all_token_error_variants_pause_and_preserve_job(self, temp_env):
+        import dataclasses
+        from docflow_agent.token_manager import (
+            TokenError,
+            TokenMissingError,
+            TokenAuthenticationError,
+            TokenReuseConflictError,
+            TokenRotationAmbiguousError,
+            TokenRateLimitedError,
+            TokenValidationError,
+            TokenStorageError,
+        )
+        config, store, watch = temp_env
+
+        error_variants = [
+            TokenMissingError("Missing refresh token in credential store", code="token_missing"),
+            TokenAuthenticationError("Refresh token revoked", code="authentication_failed"),
+            TokenReuseConflictError("Rotated token reuse conflict", code="token_reuse_conflict"),
+            TokenRotationAmbiguousError("Ambiguous token rotation outcome"),
+            TokenValidationError("Malformed refresh response from server", code="validation_error"),
+            TokenStorageError("DPAPI access failed", code="storage_error"),
+            TokenError("General token failure", code="token_error"),
+        ]
+
+        for i, exc_to_raise in enumerate(error_variants):
+            db_path = watch.parent / f"token_hier_{i}.db"
+            iter_config = dataclasses.replace(config, db_path=str(db_path))
+            queue = JobQueue.from_config(iter_config)
+            pdf = watch / f"91987654322{i}.pdf"
+            pdf.write_bytes(b"%PDF-1.4 sample")
+            val = ValidationResult(
+                is_valid=True,
+                source_path=pdf,
+                source_basename=f"91987654322{i}.pdf",
+                recipient_phone_e164=f"+91987654322{i}",
+                content_sha256=f"{i:02d}" * 32,
+                file_size_bytes=100,
+                mtime_ns=100,
+            )
+            enq = queue.enqueue(val, branch_id=str(uuid.uuid4()))
+
+            call_count = 0
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                nonlocal call_count
+                call_count += 1
+                raise exc_to_raise
+
+            client = _make_client(handler)
+            runtime = AgentRuntime(iter_config, credential_store=store, queue=queue, client=client)
+
+            assert runtime.is_paused is False
+            processed = runtime.process_next_registration_job()
+            assert processed is False
+            assert call_count == 1
+
+            # Runtime must be paused
+            assert runtime.is_paused is True
+
+            # Job must be preserved in RETRY_WAIT, not FAILED, no terminal cleanup
+            job = queue.get_job(enq.job.id)
+            assert job is not None
+            assert job.status == JobStatus.RETRY_WAIT.value
+            assert job.cleanup_eligible_at is None
+            assert job.lease_owner is None
+
+            # Subsequent calls do nothing while paused
+            assert runtime.process_next_registration_job() is False
+            assert call_count == 1
+
+    def test_service_runner_heartbeat_token_missing_and_storage_errors(self, temp_env):
+        from docflow_agent.token_manager import TokenMissingError, TokenStorageError
+        config, store, watch = temp_env
+
+        for i, exc_to_raise in enumerate([
+            TokenMissingError("Missing credentials", code="token_missing"),
+            TokenStorageError("Storage error", code="storage_error"),
+        ]):
+            db_path = watch.parent / f"hb_token_err_{i}.db"
+            import dataclasses
+            iter_config = dataclasses.replace(config, db_path=str(db_path))
+            queue = JobQueue.from_config(iter_config)
+
+            pdf = watch / f"91987654323{i}.pdf"
+            pdf.write_bytes(b"%PDF-1.4 sample")
+            val = ValidationResult(
+                is_valid=True,
+                source_path=pdf,
+                source_basename=f"91987654323{i}.pdf",
+                recipient_phone_e164=f"+91987654323{i}",
+                content_sha256=f"{i:02d}" * 32,
+                file_size_bytes=100,
+                mtime_ns=100,
+            )
+            enq = queue.enqueue(val, branch_id=str(uuid.uuid4()))
+
+            registration_called = False
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                nonlocal registration_called
+                if request.url.path == "/api/v1/agent/heartbeat":
+                    raise exc_to_raise
+                elif request.url.path == "/api/v1/agent/reports":
+                    registration_called = True
+                    return httpx.Response(202, json={})
+                return httpx.Response(404)
+
+            client = _make_client(handler)
+            runner = ServiceRunner(config=iter_config, poll_interval_seconds=0.05)
+            runner.runtime.client = client
+            runner.runtime.sync_manager.client = client
+            runner.runtime.registration_service.client = client
+
+            def delayed_stop():
+                import time
+                time.sleep(0.15)
+                runner.stop()
+
+            import threading
+            t = threading.Thread(target=delayed_stop)
+            t.start()
+
+            runner.run()
+            t.join()
+
+            assert runner.runtime.is_paused is True
+            assert registration_called is False
+            job = runner.runtime.queue.get_job(enq.job.id)
+            assert job is not None
+            assert job.status in (JobStatus.VALIDATED.value, JobStatus.RETRY_WAIT.value)

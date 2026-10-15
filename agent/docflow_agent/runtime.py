@@ -304,11 +304,15 @@ class AgentRuntime:
         if self.is_paused:
             return False
 
-        # Claim job in VALIDATED or RETRY_WAIT status
+        # Claim job in VALIDATED, RETRY_WAIT, or QUEUED status
         job = self.queue.claim_job(
             worker_id=self.worker_id,
             lease_duration_seconds=60.0,
-            eligible_statuses=[JobStatus.VALIDATED.value, JobStatus.RETRY_WAIT.value],
+            eligible_statuses=[
+                JobStatus.VALIDATED.value,
+                JobStatus.RETRY_WAIT.value,
+                JobStatus.QUEUED.value,
+            ],
         )
         if job is None:
             return False
@@ -378,10 +382,11 @@ class AgentRuntime:
             self._recover_job_on_auth_pause(job, error_code="device_revoked")
             return False
 
-        except (TokenAuthenticationError, TokenReuseConflictError) as exc:
-            logger.error("Authentication failed (%s). Pausing runtime operations.", exc.code)
-            self.is_paused = True
-            self._recover_job_on_auth_pause(job, error_code=exc.code)
+        except (TokenRateLimitedError, ApiRateLimitError) as exc:
+            retry_after = getattr(exc, "retry_after", None) or 60.0
+            logger.warning("Token or API rate limit reached. Pausing for %s seconds.", retry_after)
+            self._pause_until = time.time() + retry_after
+            self._recover_job_on_auth_pause(job, error_code="rate_limited", retry_after=retry_after)
             return False
 
         except TokenRotationAmbiguousError as exc:
@@ -390,11 +395,11 @@ class AgentRuntime:
             self._recover_job_on_auth_pause(job, error_code="token_rotation_ambiguous")
             return False
 
-        except (TokenRateLimitedError, ApiRateLimitError) as exc:
-            retry_after = getattr(exc, "retry_after", None) or 60.0
-            logger.warning("Token or API rate limit reached. Pausing for %s seconds.", retry_after)
-            self._pause_until = time.time() + retry_after
-            self._recover_job_on_auth_pause(job, error_code="rate_limited", retry_after=retry_after)
+        except (TokenError, ApiAuthenticationError) as exc:
+            code = getattr(exc, "code", type(exc).__name__)
+            logger.error("Authentication/token failure (%s). Pausing runtime operations.", code)
+            self.is_paused = True
+            self._recover_job_on_auth_pause(job, error_code=code)
             return False
 
         except RegistrationConflictError as exc:
@@ -424,11 +429,11 @@ class AgentRuntime:
             )
         except DeviceRevokedError:
             self.is_paused = True
-        except (TokenAuthenticationError, TokenReuseConflictError, TokenRotationAmbiguousError):
-            self.is_paused = True
         except (TokenRateLimitedError, ApiRateLimitError) as exc:
             retry_after = getattr(exc, "retry_after", None) or 60.0
             self._pause_until = time.time() + retry_after
+        except (TokenError, ApiAuthenticationError):
+            self.is_paused = True
         except Exception as exc:
             logger.warning("Periodic sync failed: %s", type(exc).__name__)
 

@@ -28,6 +28,7 @@ from docflow_agent.config import AgentConfig, load_config
 from docflow_agent.runtime import AgentRuntime
 from docflow_agent.sync import DeviceRevokedError
 from docflow_agent.token_manager import (
+    TokenError,
     TokenAuthenticationError,
     TokenReuseConflictError,
     TokenRotationAmbiguousError,
@@ -94,18 +95,19 @@ class ServiceRunner:
                         logger.error("Device revoked or inactive in heartbeat. Pausing runtime operations.")
                         self.runtime.is_paused = True
                         last_sync = now
-                    except (TokenAuthenticationError, TokenReuseConflictError) as exc:
-                        logger.error("Authentication failure in heartbeat (%s). Pausing runtime operations.", exc.code)
-                        self.runtime.is_paused = True
-                        last_sync = now
-                    except TokenRotationAmbiguousError:
-                        logger.error("Token rotation ambiguous in heartbeat. Pausing runtime operations.")
-                        self.runtime.is_paused = True
-                        last_sync = now
                     except (TokenRateLimitedError, ApiRateLimitError) as exc:
                         retry_after = getattr(exc, "retry_after", None) or 60.0
                         logger.warning("Heartbeat rate limited; backing off for %s seconds.", retry_after)
                         last_sync = now + retry_after - sync_interval
+                    except TokenRotationAmbiguousError:
+                        logger.error("Token rotation ambiguous in heartbeat. Pausing runtime operations.")
+                        self.runtime.is_paused = True
+                        last_sync = now
+                    except TokenError as exc:
+                        code = getattr(exc, "code", type(exc).__name__)
+                        logger.error("Authentication/token failure in heartbeat (%s). Pausing runtime operations.", code)
+                        self.runtime.is_paused = True
+                        last_sync = now
                     except Exception as exc:
                         logger.warning("Heartbeat sync failed: %s", type(exc).__name__)
                         last_sync = now

@@ -132,9 +132,9 @@ class ReportRegistrationService:
         # 1. State verification and pre-request transition
         current_job = job
         if current_job.status != JobStatus.METADATA_REGISTERING.value:
-            if current_job.status not in (JobStatus.VALIDATED.value, JobStatus.RETRY_WAIT.value):
+            if current_job.status not in (JobStatus.VALIDATED.value, JobStatus.RETRY_WAIT.value, JobStatus.QUEUED.value):
                 raise RegistrationError(
-                    f"Job '{job.id}' is in status '{job.status}'; expected 'validated' or 'retry_wait'."
+                    f"Job '{job.id}' is in status '{job.status}'; expected 'validated', 'retry_wait', or 'queued'."
                 )
             current_job = self.queue.update_status(
                 job.id,
@@ -193,12 +193,15 @@ class ReportRegistrationService:
             )
             raise DeviceRevokedError(detail="Device or branch revoked or inactive.", request_id=exc.request_id) from exc
 
-        except (TokenAuthenticationError, TokenReuseConflictError) as exc:
-            logger.error("Authentication failed during report registration: %s", exc.code)
+        except (TokenRateLimitedError, ApiRateLimitError) as exc:
+            retry_after = getattr(exc, "retry_after", None) or 60.0
+            logger.warning("Rate limited during report registration; backing off for %s seconds.", retry_after)
+            next_attempt_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=retry_after)
             self.queue.update_status(
                 current_job.id,
                 JobStatus.RETRY_WAIT,
-                error_code=exc.code,
+                error_code="rate_limited",
+                next_attempt_at=next_attempt_dt.isoformat(),
                 increment_attempt=False,
             )
             raise
@@ -213,15 +216,13 @@ class ReportRegistrationService:
             )
             raise
 
-        except (TokenRateLimitedError, ApiRateLimitError) as exc:
-            retry_after = getattr(exc, "retry_after", None) or 60.0
-            logger.warning("Rate limited during report registration; backing off for %s seconds.", retry_after)
-            next_attempt_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=retry_after)
+        except (TokenError, ApiAuthenticationError) as exc:
+            code = getattr(exc, "code", type(exc).__name__)
+            logger.error("Authentication or token failure during report registration: %s", code)
             self.queue.update_status(
                 current_job.id,
                 JobStatus.RETRY_WAIT,
-                error_code="rate_limited",
-                next_attempt_at=next_attempt_dt.isoformat(),
+                error_code=code,
                 increment_attempt=False,
             )
             raise

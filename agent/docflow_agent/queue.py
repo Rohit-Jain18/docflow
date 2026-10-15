@@ -79,6 +79,7 @@ class JobStatus(str, Enum):
 
     DISCOVERED = "discovered"
     WAITING_STABILITY = "waiting_stability"
+    QUEUED = "queued"
     VALIDATED = "validated"
     METADATA_REGISTERING = "metadata_registering"
     METADATA_REGISTERED = "metadata_registered"
@@ -104,12 +105,21 @@ ALLOWED_STATUS_TRANSITIONS: dict[str, frozenset[str]] = {
     }),
     JobStatus.WAITING_STABILITY.value: frozenset({
         JobStatus.VALIDATED.value,
+        JobStatus.QUEUED.value,
+        JobStatus.RETRY_WAIT.value,
+        JobStatus.QUARANTINED.value,
+        JobStatus.FAILED.value,
+    }),
+    JobStatus.QUEUED.value: frozenset({
+        JobStatus.VALIDATED.value,
+        JobStatus.METADATA_REGISTERING.value,
         JobStatus.RETRY_WAIT.value,
         JobStatus.QUARANTINED.value,
         JobStatus.FAILED.value,
     }),
     JobStatus.VALIDATED.value: frozenset({
         JobStatus.METADATA_REGISTERING.value,
+        JobStatus.QUEUED.value,
         JobStatus.RETRY_WAIT.value,
         JobStatus.QUARANTINED.value,
         JobStatus.FAILED.value,
@@ -999,6 +1009,7 @@ class JobQueue:
             eligible_statuses = [
                 JobStatus.VALIDATED.value,
                 JobStatus.RETRY_WAIT.value,
+                JobStatus.QUEUED.value,
             ]
 
         now_dt = datetime.now(timezone.utc)

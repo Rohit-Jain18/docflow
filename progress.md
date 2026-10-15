@@ -708,3 +708,41 @@
 - **Decisions:** Keep Windows packaged binary status as Unverified until a frozen executable is built and smoke-tested on Windows. Preserve historical ledger entries intact while appending dated corrective notes.
 - **Open issues/blockers:** Windows packaged-binary smoke testing on Windows host pending. Phase 3 deferred.
 - **Next step:** Commit and push corrective review changes to `origin/main`.
+
+## 2026-10-15T17:48:00+05:30 — Phase 2 Final Runtime Integration Verification
+
+- **Phase / task:** Phase 2 / Final Runtime Integration Verification
+- **Goal:** Verify and complete the registration-state pipeline, verify comprehensive `TokenError` hierarchy handling across runtime and service runner, factually verify Windows service and packaging status, and add regression tests.
+- **Inspection:** Inspected `agent/docflow_agent/queue.py`, `watcher.py`, `runtime.py`, `registration.py`, `service.py`, `retention.py`, `agent/tests/test_runtime.py`, `test_queue.py`, `test_registration.py`, `requirements.txt`, and entry points.
+- **Changes:**
+  - `agent/docflow_agent/queue.py`: Added `JobStatus.QUEUED = "queued"`; permitted transitions `WAITING_STABILITY -> QUEUED`, `VALIDATED -> QUEUED`, and `QUEUED -> {VALIDATED, METADATA_REGISTERING, RETRY_WAIT, QUARANTINED, FAILED}`; updated `claim_job()` default `eligible_statuses` to include `JobStatus.QUEUED.value` alongside `VALIDATED` and `RETRY_WAIT`.
+  - `agent/docflow_agent/retention.py`: Added `JobStatus.QUEUED.value` to `BLOCKING_OPERATION_STATUSES` to prevent premature cleanup of queued jobs.
+  - `agent/docflow_agent/registration.py`: Allowed `JobStatus.QUEUED.value` as a valid starting state in `register_job()`; ensured all `TokenError` variants (`TokenMissingError`, `TokenAuthenticationError`, `TokenReuseConflictError`, `TokenRotationAmbiguousError`, `TokenRateLimitedError`, `TokenValidationError`, `TokenStorageError`) preserve jobs in `RETRY_WAIT` without burning retry budgets or arming terminal cleanup.
+  - `agent/docflow_agent/runtime.py`: Updated `process_next_registration_job()` to claim `[VALIDATED, RETRY_WAIT, QUEUED]`; updated exception handling in `process_next_registration_job()` and `run_once()` to catch all `TokenError` variants, setting `self.is_paused = True` to halt registration sweeps, recovering in-flight jobs to `RETRY_WAIT` (`increment_attempt=False`), and safely releasing worker leases in `finally`.
+  - `agent/docflow_agent/service.py`: Updated `ServiceRunner.run()` to catch all `TokenError` variants in heartbeat/sync cycles, setting `runtime.is_paused = True` to prevent repeated dispatch attempts when credentials are unusable.
+  - `agent/tests/test_queue.py`: Added test `test_queued_status_claimable_and_transitionable`.
+  - `agent/tests/test_registration.py`: Added test `test_registration_from_queued_starting_state`.
+  - `agent/tests/test_runtime.py`:
+    - Added `test_end_to_end_watcher_to_registration_and_duplicate_events`: full end-to-end watcher candidate file ingestion, stability check, validation, queue enqueue, worker claiming, mocked 202 registration, status progression to `METADATA_REGISTERED`, duplicate watcher event deduplication without queue duplicate insertion, and restart/expired lease recovery via `startup_recovery()`.
+    - Added `test_runtime_all_token_error_variants_pause_and_preserve_job`: tests all 7 `TokenError` variants (`TokenMissingError`, `TokenAuthenticationError`, `TokenReuseConflictError`, `TokenRotationAmbiguousError`, `TokenValidationError`, `TokenStorageError`, `TokenError`), verifying runtime pauses, job is preserved in `RETRY_WAIT`, no terminal cleanup is armed, and subsequent registration calls return False.
+    - Added `test_service_runner_heartbeat_token_missing_and_storage_errors`: verifies service runner pauses and skips registration when heartbeat suffers token errors.
+- **Why:** Ensure newly discovered jobs are unambiguously eligible for registration; ensure all token failure modes fail safe by pausing without thrashing, burning retry budgets, or losing source files; and factually record Windows SCM and packaging readiness.
+- **Commands run:**
+  - `agent\.venv\Scripts\python -m pytest agent\tests -q` (505 passed, 2 skipped in 33.18s)
+  - `agent\.venv\Scripts\python -m compileall -q agent\docflow_agent agent\tests` (clean, exit code 0)
+  - `agent\.venv\Scripts\python -c "import docflow_agent.queue; import docflow_agent.retention; import docflow_agent.registration; import docflow_agent.runtime; import docflow_agent.service; print('Imports successful')"` (Imports successful)
+  - `git diff --check` (clean, 0 whitespace errors)
+- **Tests/checks:**
+  - Full Agent Test Suite: **505 passed, 2 skipped in 33.18s** across 19 test modules (0 failures, 0 errors).
+  - Python Bytecode Compilation: **100% clean**.
+  - Module Imports: **100% clean**.
+  - Git Diff Checks: **100% clean**.
+- **Security/reliability checks:** Jobs preserved safely in `RETRY_WAIT` during auth failures without arming cleanup; worker leases released safely in `finally`; ambiguous refresh never blindly retried; runtime pauses immediately upon token error; Windows reparse points/symlinks safely rejected.
+- **Windows Service Status Verification:**
+  - Inspected `service.py`, `setup.py` / `pyproject.toml`, `requirements.txt`, and entry points.
+  - Neither Windows Service Control Manager (SCM) integration (`pywin32` / `win32serviceutil.ServiceFramework`) nor frozen executable packaging (`PyInstaller`) currently exists in the repository.
+  - `ServiceRunner` in `service.py` is a Python process runner handling standard OS signals (`SIGINT`, `SIGTERM`), but does not interface with Windows SCM APIs.
+  - Windows SCM integration and frozen binary packaging remain factually **Unverified** per project roadmap; scope was not expanded without real implementation and smoke tests.
+- **Decisions:** Support both `JobStatus.VALIDATED` and `JobStatus.QUEUED` as eligible starting statuses for worker claiming and registration; treat all `TokenError` variants as pause triggers in runtime and service runner.
+- **Open issues/blockers:** Phase 2 complete. Windows SCM integration and frozen PyInstaller packaging remain unverified/deferred to production deployment engineering. Phase 3 deferred.
+- **Next step:** Commit and push integration verification to `origin/main`.
