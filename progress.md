@@ -364,4 +364,36 @@
 - **Open issues/blockers:** None for Task 3A. Production device registration HTTP endpoints deferred to upcoming task.
 - **Next step:** Phase 1 Task 3A complete. Awaiting approval to proceed to next task.
 
+## 2026-10-15T12:25:00+05:30 — Phase 2 Task 2A: Windows Agent Foundation
+
+- **Phase / task:** Phase 2 / Task 2A — Windows Agent Foundation
+- **Goal:** Create a minimal, runnable Python Windows Agent foundation in the existing agent/ directory including package structure, CLI entry point, configuration module, logging module with redaction, lifecycle/health module, secure credential stores (Windows Credential Manager and DPAPI backing with in-memory test double), and focused tests.
+- **Inspection:** Inspected [agent/CLAUDE.md](file:///c:/Rohit's-Workspace/Docflow/agent/CLAUDE.md), [docs/AGENT_SPEC.md](file:///c:/Rohit's-Workspace/Docflow/docs/AGENT_SPEC.md), [docs/ARCHITECTURE.md](file:///c:/Rohit's-Workspace/Docflow/docs/ARCHITECTURE.md), [docs/ENVIRONMENT.md](file:///c:/Rohit's-Workspace/Docflow/docs/ENVIRONMENT.md), [docs/SECURITY.md](file:///c:/Rohit's-Workspace/Docflow/docs/SECURITY.md), existing agent/ directory and Git status.
+- **Changes:**
+  - `agent/requirements.txt`: Agent core dependencies file.
+  - `agent/requirements-dev.txt`: Agent dev dependencies including pytest.
+  - `agent/docflow_agent/__init__.py`: Package init exposing `__version__ = "0.1.0"`.
+  - `agent/docflow_agent/__main__.py`: Package execution entrypoint invoking CLI main.
+  - `agent/docflow_agent/cli.py`: CLI commands (`health`, `status`, `version`), setting up logging and executing readiness inspections.
+  - `agent/docflow_agent/config.py`: Configuration loading from environment variables (with `_ENV_ALIASES` matching `ENVIRONMENT.md` §5) and optional TOML file, strict validation, type coercion, prevention of folder nesting, and rejection of prohibited secret keys.
+  - `agent/docflow_agent/credentials.py`: Secure credential storage interface `CredentialStore`, `WindowsCredentialManagerStore` (using `advapi32.dll` via `ctypes`), `WindowsDpapiStore` (using `crypt32.dll` via `ctypes`), `InMemoryCredentialStore` (test double / non-Windows fallback), and `get_credential_store()` resolver.
+  - `agent/docflow_agent/logging.py`: Structured logging setup with `RedactionFilter` scrubbing phone numbers, bearer tokens, secret keys, temporary URLs, and sensitive Windows paths across both console and file handlers.
+  - `agent/docflow_agent/health.py`: Readiness inspection checking configuration validity, watch-folder existence and read access, write permissions on archive/quarantine/db folders, credential store accessibility, prohibited secret variable exposure, and API URL scheme.
+  - `agent/tests/test_cli.py`: Focused tests for CLI `health`, `status`, `version`, and help commands.
+  - `agent/tests/test_config.py`: Focused tests for configuration loading, defaults, overrides, validation rules, TOML parsing, frozen dataclass, environment aliases, and prohibited secrets rejection.
+  - `agent/tests/test_credentials.py`: Focused tests for `InMemoryCredentialStore`, `WindowsCredentialManagerStore`, `WindowsDpapiStore`, and factory selection.
+  - `agent/tests/test_health.py`: Focused tests for healthy configurations, unhealthy folders, invalid log levels, credential store readiness, and secret exposure detection.
+  - `agent/tests/test_logging.py`: Focused tests for redaction patterns, logging filter with string and dict args, logger initialization, and file logging with redaction.
+- **Why:** Establish Windows Agent runtime foundation per AGENT_SPEC.md §§ 1-2, SECURITY.md § 3, and ENVIRONMENT.md § 5 without storing plaintext credentials or raw secrets.
+- **Commands run:**
+  - `agent\.venv\Scripts\python -m pytest agent\tests -v --tb=short` — 68 passed in 0.61s.
+  - `$env:PYTHONPATH="agent"; agent\.venv\Scripts\python -m docflow_agent version` — Output: `docflow-agent 0.1.0`.
+  - `$env:PYTHONPATH="agent"; agent\.venv\Scripts\python -m docflow_agent status` — Verified HEALTHY and UNHEALTHY scenarios.
+  - `backend\.venv\Scripts\python backend\manage.py check --settings=config.settings.development` — System check identified no issues (0 silenced).
+- **Tests/checks:** 68 agent tests run, 0 failures, 0 errors. Backend check 0 issues.
+- **Security/reliability checks:** Plaintext credentials and tokens are prohibited in config files/env; secrets storage interfaces with Windows Credential Manager and DPAPI; logs redact phones, bearer tokens, passwords, temp URLs, and paths; watch/archive/quarantine folder separation is enforced against recursive watching.
+- **Decisions:** Use Python standard library ctypes for zero-dependency Windows Credential Manager (`advapi32.dll`) and DPAPI (`crypt32.dll`) stores; support both `DOCFLOW_AGENT_*` and `ENVIRONMENT.md` documented variable names; provide `status` as an alias for `health`.
+- **Open issues/blockers:** None for Task 2A. Local SQLite schema migrations, stable-file watcher, and phone parsing deferred to subsequent Phase 2 tasks.
+- **Next step:** Phase 2 Task 2A complete. Ready for Task 2B (Local SQLite Queue and Job Persistence) or next instruction.
+
 

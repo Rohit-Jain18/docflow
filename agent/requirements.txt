@@ -1,0 +1,2 @@
+# Docflow Windows Agent – Python 3.13
+# Core dependencies only. No Django, no backend deps.
