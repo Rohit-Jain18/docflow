@@ -46,6 +46,18 @@ from docflow_agent.queue import (
 )
 from docflow_agent.recipient import mask_phone, validate_recipient
 from docflow_agent.stability import StabilityResult, check_stability
+from docflow_agent.token_manager import (
+    TokenAuthenticationError,
+    TokenError,
+    TokenManager,
+    TokenMissingError,
+    TokenRateLimitedError,
+    TokenReuseConflictError,
+    TokenRotationAmbiguousError,
+    TokenStatus,
+    TokenStorageError,
+    TokenValidationError,
+)
 from docflow_agent.watcher import Watcher, is_candidate_file, process_candidate_file
 
 __all__ = [
@@ -76,6 +88,16 @@ __all__ = [
     "JobStatus",
     "QuarantineResult",
     "StabilityResult",
+    "TokenAuthenticationError",
+    "TokenError",
+    "TokenManager",
+    "TokenMissingError",
+    "TokenRateLimitedError",
+    "TokenReuseConflictError",
+    "TokenRotationAmbiguousError",
+    "TokenStatus",
+    "TokenStorageError",
+    "TokenValidationError",
     "UntrustedOriginError",
     "ValidationResult",
     "Watcher",

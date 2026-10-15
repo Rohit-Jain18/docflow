@@ -500,4 +500,29 @@
 - **Open issues/blockers:** Refresh token rotation (`POST /api/v1/agent/activation/refresh`) and background heartbeat/sync remain to be implemented.
 - **Next step:** Implement refresh-token rotation service and background token refresh lifecycle.
 
+## 2026-10-15T16:15:00+05:30 — Phase 2 Task 2D-3: Refresh Token Rotation and In-Memory Access Token Management
 
+- **Phase / task:** Phase 2 / Task 2D-3 — Refresh Token Rotation and In-Memory Access Token Management
+- **Goal:** Implement reusable, thread-safe in-memory access token management and rotating refresh token lifecycle (`TokenManager`) against `POST /api/v1/agent/auth/refresh` without bearer authentication, enforcing strict UTC Z timestamps, persisting rotated refresh tokens securely before updating in-memory access tokens, providing proactive early refresh with safety buffers, failing closed on terminal errors, and blocking automatic retries on ambiguous network/timeout errors to prevent server-side token reuse revocation per AGENT_SPEC.md § 2, API_CONTRACTS.md § 3, and SECURITY.md § 3.
+- **Inspection:** Inspected `docs/API_CONTRACTS.md` §§ 1–3, `docs/AGENT_SPEC.md` § 2, `docs/SECURITY.md` § 3, `backend/apps/devices/views.py` (`RefreshTokenView`), `backend/apps/devices/services.py` (`rotate_refresh_token`), `backend/apps/devices/serializers.py` (`RefreshTokenSerializer`), `backend/apps/devices/exceptions.py`, `agent/docflow_agent/client.py`, `activation.py`, `credentials.py`, and existing tests.
+- **Changes:**
+  - `agent/docflow_agent/token_manager.py`: Created `TokenManager` coordinating refresh token rotation and in-memory access token cache; implemented `TokenStatus`, `TokenError`, `TokenMissingError`, `TokenAuthenticationError`, `TokenReuseConflictError`, `TokenRateLimitedError`, `TokenValidationError`, `TokenStorageError`, and `TokenRotationAmbiguousError`; implemented double-checked locking under `threading.RLock`, proactive early refresh within configurable `safety_window_seconds`, strict ISO 8601 UTC Z timestamp validation, atomic credential store update prior to publishing new access token, fail-closed handling of 401/409/429/500/storage errors, and blocking automatic retries after ambiguous timeouts or network errors.
+  - `agent/docflow_agent/__init__.py`: Exported `TokenManager`, `TokenStatus`, and token exception hierarchy at package level.
+  - `agent/tests/test_token_manager.py`: 32 comprehensive unit and integration tests covering rotation success, proactive refresh within safety window, thread-safe concurrency (10 concurrent threads sharing 1 rotation request), 401 invalid/revoked credentials, 409 reuse conflict, 429 rate limit with `Retry-After`, malformed/missing fields and non-UTC timestamps, storage write failure failing closed, invalidation of old access token on refresh failure, timeout/connection error marking ambiguous state and blocking automatic retry, secret leakage prevention across logs/exceptions/reprs, and integration with `ApiClient.token_provider`.
+  - `progress.md`: Appended Task 2D-3 entry.
+- **Why:** Laboratory Windows Agents require short-lived access tokens (10-minute lifetime) for authenticated API operations while rotating 30-day refresh credentials atomically on every refresh. Access tokens must never touch disk or logs, and ambiguous rotation attempts must not be blindly retried to avoid triggering the backend's token-theft reuse revocation policy.
+- **Commands run:**
+  - `agent\.venv\Scripts\python -m pytest agent/tests/test_token_manager.py -v` (32 passed in 0.68s)
+  - `agent\.venv\Scripts\python -m pytest agent/tests -v` (435 passed in 17.33s across all 14 test files)
+  - `agent\.venv\Scripts\python -m py_compile agent/docflow_agent/token_manager.py agent/docflow_agent/__init__.py agent/tests/test_token_manager.py`
+  - `agent\.venv\Scripts\python -c "import sys; sys.path.insert(0, 'agent'); import docflow_agent; from docflow_agent.token_manager import TokenManager, TokenStatus, TokenError; print('TOKEN MANAGER IMPORT OK')"`
+  - `git diff --check`
+- **Tests/checks:**
+  - Focused token manager tests: 32 passed, 0 failures.
+  - Full Windows Agent test suite: 435 passed across all 14 test files (6 cli + 51 config + 15 credentials + 22 health + 51 logging + 10 pdf + 5 quarantine + 30 queue + 21 recipient + 5 stability + 19 watcher + 97 client + 71 activation + 32 token_manager).
+  - Python compilation and module import checks: OK.
+  - `git diff --check`: OK (clean).
+- **Security/reliability checks:** Access tokens held in memory only; refresh secrets stored only in OS-backed `CredentialStore`; new refresh token persisted securely before publishing new access token; old access token invalidated upon refresh failure; ambiguous timeouts/network errors block automatic retry; raw tokens excluded from logs, exceptions, and `repr` strings; double-checked locking prevents competing rotation requests.
+- **Decisions:** TokenManager provides `get_access_token` conforming to `TokenProvider` signature for seamless `ApiClient` integration; `is_ambiguous` flag prevents blind retry after lost responses; default safety buffer set to 60 seconds.
+- **Open issues/blockers:** Device heartbeat, configuration sync, and report outbox dispatch remain to be implemented in subsequent Phase 2 tasks.
+- **Next step:** Implement agent device heartbeat and configuration synchronization service.
