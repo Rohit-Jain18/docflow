@@ -115,6 +115,22 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return runner.run()
 
 
+def _cmd_service(args: argparse.Namespace) -> int:
+    """Manage the Docflow Agent Windows Service."""
+    from docflow_agent.service import handle_service_command
+
+    service_action = getattr(args, "action", None)
+    if not service_action:
+        print("Error: Service action is required (install, remove, update, start, stop, restart, status, debug).", file=sys.stderr)
+        return 1
+
+    argv = ["docflow-agent", service_action]
+    if getattr(args, "startup", None):
+        argv.extend(["--startup", args.startup])
+    return handle_service_command(argv=argv)
+
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point.
 
@@ -169,6 +185,25 @@ def main(argv: list[str] | None = None) -> int:
         help="Perform a single sweep and exit.",
     )
     run_parser.set_defaults(func=_cmd_run)
+
+    # service
+    service_parser = subparsers.add_parser(
+        "service",
+        help="Manage the Docflow Windows Service (install, remove, update, start, stop, restart, status, debug).",
+    )
+    service_parser.add_argument(
+        "action",
+        choices=["install", "remove", "update", "start", "stop", "restart", "status", "debug"],
+        help="Windows Service action to perform.",
+    )
+    service_parser.add_argument(
+        "--startup",
+        choices=["auto", "manual", "disabled", "delayed"],
+        default=None,
+        help="Startup type for install/update.",
+    )
+    service_parser.set_defaults(func=_cmd_service)
+
 
     args = parser.parse_args(argv)
 
