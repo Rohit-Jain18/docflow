@@ -7,6 +7,20 @@ report registration and delivery through the Docflow control plane.
 
 __version__ = "0.1.0"
 
+from docflow_agent.client import (
+    ApiClient,
+    ApiClientError,
+    ApiAuthenticationError,
+    ApiConflictError,
+    ApiConnectionError,
+    ApiNotFoundError,
+    ApiPayloadError,
+    ApiPermissionError,
+    ApiRateLimitError,
+    ApiResponseError,
+    ApiTimeoutError,
+    UntrustedOriginError,
+)
 from docflow_agent.pdf import ValidationResult, validate_pdf
 from docflow_agent.quarantine import QuarantineResult, quarantine_file, should_quarantine
 from docflow_agent.queue import (
@@ -24,6 +38,17 @@ from docflow_agent.stability import StabilityResult, check_stability
 from docflow_agent.watcher import Watcher, is_candidate_file, process_candidate_file
 
 __all__ = [
+    "ApiClient",
+    "ApiClientError",
+    "ApiAuthenticationError",
+    "ApiConflictError",
+    "ApiConnectionError",
+    "ApiNotFoundError",
+    "ApiPayloadError",
+    "ApiPermissionError",
+    "ApiRateLimitError",
+    "ApiResponseError",
+    "ApiTimeoutError",
     "EnqueueResult",
     "JobEvent",
     "JobQueue",
@@ -31,6 +56,7 @@ __all__ = [
     "JobStatus",
     "QuarantineResult",
     "StabilityResult",
+    "UntrustedOriginError",
     "ValidationResult",
     "Watcher",
     "__version__",
@@ -46,4 +72,3 @@ __all__ = [
     "validate_pdf",
     "validate_recipient",
 ]
-
